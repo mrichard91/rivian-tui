@@ -1,0 +1,19 @@
+/target
+Cargo.lock
+
+# Secrets / auth
+*.env
+.env*
+auth.json
+*.mfa
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
