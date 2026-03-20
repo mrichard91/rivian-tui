@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
@@ -16,7 +18,6 @@ pub const CHARGING_URL: &str = "https://rivian.com/api/gql/chrg/user/graphql";
 #[derive(Debug, Clone)]
 pub struct RequestLog {
     pub operation: String,
-    pub url: String,
     pub status: Option<u16>,
     pub duration_ms: u128,
     pub error: Option<String>,
@@ -40,6 +41,8 @@ impl RivianClient {
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .gzip(true)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
@@ -100,12 +103,10 @@ impl RivianClient {
                 // Mask auth tokens in header values
                 let masked = if k.as_str().eq_ignore_ascii_case("authorization")
                     || k.as_str().eq_ignore_ascii_case("csrf-token")
+                    || k.as_str().eq_ignore_ascii_case("a-sess")
+                    || k.as_str().eq_ignore_ascii_case("u-sess")
                 {
-                    if val.len() > 20 {
-                        format!("{}...{}", &val[..10], &val[val.len() - 4..])
-                    } else {
-                        val.to_string()
-                    }
+                    Self::redact_secret_str(val)
                 } else {
                     val.to_string()
                 };
@@ -113,6 +114,72 @@ impl RivianClient {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn redact_secret_str(value: &str) -> String {
+        if value.len() <= 8 {
+            "<redacted>".into()
+        } else {
+            format!("{}...{}", &value[..4], &value[value.len() - 4..])
+        }
+    }
+
+    fn is_sensitive_key(key: &str) -> bool {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "authorization"
+                | "csrf-token"
+                | "csrtftoken"
+                | "csrf"
+                | "access_token"
+                | "accesstoken"
+                | "refresh_token"
+                | "refreshtoken"
+                | "user_session_token"
+                | "usersessiontoken"
+                | "app_session_token"
+                | "appsessiontoken"
+                | "otp_token"
+                | "otptoken"
+                | "otp_code"
+                | "otpcode"
+                | "password"
+                | "email"
+                | "a-sess"
+                | "u-sess"
+        )
+    }
+
+    fn redact_json_value(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    if Self::is_sensitive_key(key) {
+                        *child = Value::String(Self::redact_secret_str(
+                            child.as_str().unwrap_or("<redacted>"),
+                        ));
+                    } else {
+                        Self::redact_json_value(child);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    Self::redact_json_value(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn redact_json_text(text: &str) -> String {
+        match serde_json::from_str::<Value>(text) {
+            Ok(mut value) => {
+                Self::redact_json_value(&mut value);
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "<redacted>".into())
+            }
+            Err(_) => "<non-json body omitted>".into(),
+        }
     }
 
     /// Execute a GraphQL query against the given URL.
@@ -159,7 +226,6 @@ impl RivianClient {
         // Emit log entry
         self.emit_log(RequestLog {
             operation: operation_name.to_string(),
-            url: url.to_string(),
             status: Some(status.as_u16()),
             duration_ms,
             error: if !status.is_success() {
@@ -168,11 +234,17 @@ impl RivianClient {
                 None
             },
             request_body: if self.debug {
-                Some(serde_json::to_string_pretty(&body).unwrap_or_default())
+                let mut redacted = body.clone();
+                Self::redact_json_value(&mut redacted);
+                Some(serde_json::to_string_pretty(&redacted).unwrap_or_default())
             } else {
                 None
             },
-            response_body: if self.debug { Some(text.clone()) } else { None },
+            response_body: if self.debug {
+                Some(Self::redact_json_text(&text))
+            } else {
+                None
+            },
             request_headers: if self.debug {
                 Some(Self::format_headers(&headers))
             } else {
@@ -184,29 +256,51 @@ impl RivianClient {
             bail!("HTTP {status}: {text}");
         }
 
-        let gql_resp: GraphQlResponse<T> = serde_json::from_str(&text)
+        let gql_resp: GraphQlResponse<Value> = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse response: {text}"))?;
 
         if let Some(errors) = gql_resp.errors {
-            let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+            let msgs: Vec<_> = errors.iter().map(|e| e.display_message()).collect();
             bail!("GraphQL errors: {}", msgs.join("; "));
         }
 
-        gql_resp
+        let data = gql_resp
             .data
-            .context("GraphQL response contained no data")
-    }
+            .context("GraphQL response contained no data")?;
 
-    /// Execute a raw GraphQL query and return the JSON value
-    pub async fn graphql_raw(
-        &self,
-        url: &str,
-        operation_name: &str,
-        query: &str,
-        variables: Option<Value>,
-        extra_headers: Option<Vec<(&str, String)>>,
-    ) -> Result<Value> {
-        self.graphql(url, operation_name, query, variables, extra_headers)
-            .await
+        serde_json::from_value(data).context("failed to parse GraphQL data payload")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_sensitive_json_fields() {
+        let mut value = serde_json::json!({
+            "variables": {
+                "email": "driver@example.com",
+                "password": "supersecret",
+                "otpCode": "123456"
+            },
+            "data": {
+                "login": {
+                    "accessToken": "access-abcdef123456",
+                    "refreshToken": "refresh-abcdef123456"
+                }
+            }
+        });
+
+        RivianClient::redact_json_value(&mut value);
+
+        assert_ne!(value["variables"]["email"], "driver@example.com");
+        assert_ne!(value["variables"]["password"], "supersecret");
+        assert_ne!(value["variables"]["otpCode"], "123456");
+        assert_ne!(value["data"]["login"]["accessToken"], "access-abcdef123456");
+        assert_ne!(
+            value["data"]["login"]["refreshToken"],
+            "refresh-abcdef123456"
+        );
     }
 }

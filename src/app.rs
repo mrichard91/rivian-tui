@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local, Utc};
 use tokio::sync::mpsc;
 
-use crate::api::auth::{AuthManager, LoginOutcome};
+use crate::api::auth::{AuthManager, LoginOutcome, PendingVehicleSelection};
 use crate::api::client::{API_URL, CHARGING_URL, RequestLog, RivianClient};
 use crate::api::queries;
 use crate::api::types::*;
@@ -13,6 +13,7 @@ pub enum Mode {
     Dashboard,
     Login,
     MfaPrompt,
+    VehicleSelect,
 }
 
 /// Input field currently focused during login
@@ -41,13 +42,53 @@ pub struct LogEntry {
 
 /// Events sent from background tasks to the main loop
 pub enum AppEvent {
-    VehicleState(VehicleStateFields),
-    AuthSuccess(AuthTokens),
-    MfaRequired(MfaState),
-    Error(String),
-    Log(LogEntry),
-    RequestLog(RequestLog),
-    ChargingSessions(Vec<ChargingSession>),
+    VehicleState {
+        generation: u64,
+        state: Box<VehicleStateFields>,
+    },
+    AuthSuccess {
+        generation: u64,
+        tokens: AuthTokens,
+    },
+    MfaRequired {
+        generation: u64,
+        mfa: MfaState,
+    },
+    VehicleSelectionRequired {
+        generation: u64,
+        pending: PendingVehicleSelection,
+    },
+    Error {
+        generation: u64,
+        msg: String,
+    },
+    Log {
+        generation: u64,
+        entry: LogEntry,
+    },
+    RequestLog {
+        generation: u64,
+        req_log: RequestLog,
+    },
+    ChargingSessions {
+        generation: u64,
+        sessions: Vec<ChargingSession>,
+    },
+}
+
+impl AppEvent {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::VehicleState { generation, .. }
+            | Self::AuthSuccess { generation, .. }
+            | Self::MfaRequired { generation, .. }
+            | Self::VehicleSelectionRequired { generation, .. }
+            | Self::Error { generation, .. }
+            | Self::Log { generation, .. }
+            | Self::RequestLog { generation, .. }
+            | Self::ChargingSessions { generation, .. } => *generation,
+        }
+    }
 }
 
 pub struct App {
@@ -58,6 +99,7 @@ pub struct App {
     // Auth
     pub tokens: Option<AuthTokens>,
     pub mfa_state: Option<MfaState>,
+    pub pending_vehicle_selection: Option<PendingVehicleSelection>,
 
     // Login form
     pub login_email: String,
@@ -66,6 +108,7 @@ pub struct App {
     pub login_field: LoginField,
     pub login_error: Option<String>,
     pub login_busy: bool,
+    pub vehicle_selection_index: usize,
 
     // Vehicle data
     pub vehicle_state: Option<VehicleStateFields>,
@@ -75,12 +118,14 @@ pub struct App {
     // Activity log
     pub activity_log: Vec<LogEntry>,
     pub log_scroll: usize,
+    pub log_selected: usize,
     pub show_debug_detail: bool,
     pub show_log: bool,
 
     // Database
     pub db: Option<Db>,
     pub db_snapshot_count: i64,
+    pub generation: u64,
 
     // Channel for receiving background events
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -97,6 +142,7 @@ impl App {
 
             tokens: None,
             mfa_state: None,
+            pending_vehicle_selection: None,
 
             login_email: String::new(),
             login_password: String::new(),
@@ -104,6 +150,7 @@ impl App {
             login_field: LoginField::Email,
             login_error: None,
             login_busy: false,
+            vehicle_selection_index: 0,
 
             vehicle_state: None,
             last_update: None,
@@ -111,11 +158,13 @@ impl App {
 
             activity_log: Vec::new(),
             log_scroll: 0,
+            log_selected: 0,
             show_debug_detail: false,
             show_log: false,
 
             db: None,
             db_snapshot_count: 0,
+            generation: 0,
 
             event_tx,
             event_rx,
@@ -126,6 +175,7 @@ impl App {
     fn make_client(
         debug: bool,
         event_tx: &mpsc::UnboundedSender<AppEvent>,
+        generation: u64,
     ) -> Result<RivianClient, anyhow::Error> {
         let (log_tx, mut log_rx) = mpsc::unbounded_channel::<RequestLog>();
         let app_tx = event_tx.clone();
@@ -133,11 +183,26 @@ impl App {
         // Forward request logs to app events
         tokio::spawn(async move {
             while let Some(req_log) = log_rx.recv().await {
-                let _ = app_tx.send(AppEvent::RequestLog(req_log));
+                let _ = app_tx.send(AppEvent::RequestLog {
+                    generation,
+                    req_log,
+                });
             }
         });
 
         RivianClient::new().map(|c| c.with_debug(debug).with_logger(log_tx))
+    }
+
+    fn focus_last_log(&mut self) {
+        if self.activity_log.is_empty() {
+            self.log_scroll = 0;
+            self.log_selected = 0;
+            return;
+        }
+
+        let visible = 10;
+        self.log_selected = self.activity_log.len() - 1;
+        self.log_scroll = self.log_selected.saturating_sub(visible - 1);
     }
 
     pub fn log(&mut self, level: LogLevel, msg: &str) {
@@ -147,11 +212,7 @@ impl App {
             message: msg.to_string(),
             detail: None,
         });
-        // Auto-scroll to bottom
-        let visible = 10; // approximate visible log lines
-        if self.activity_log.len() > visible {
-            self.log_scroll = self.activity_log.len() - visible;
-        }
+        self.focus_last_log();
     }
 
     fn log_with_detail(&mut self, level: LogLevel, msg: &str, detail: String) {
@@ -161,10 +222,7 @@ impl App {
             message: msg.to_string(),
             detail: Some(detail),
         });
-        let visible = 10;
-        if self.activity_log.len() > visible {
-            self.log_scroll = self.activity_log.len() - visible;
-        }
+        self.focus_last_log();
     }
 
     /// Initialize database and load auth tokens on startup
@@ -180,18 +238,6 @@ impl App {
                 self.log(LogLevel::Error, &format!("Database failed: {e}"));
             }
         }
-        // Log where we expect the file
-        if let Some(path) = dirs::config_dir() {
-            let token_path = path.join("rivian-tui").join("tokens.json");
-            self.log(
-                LogLevel::Info,
-                &format!(
-                    "Checking {} (exists: {})",
-                    token_path.display(),
-                    token_path.exists()
-                ),
-            );
-        }
 
         match AuthManager::load_tokens() {
             Ok(Some(tokens)) => {
@@ -204,7 +250,7 @@ impl App {
             }
             Ok(None) => {
                 self.mode = Mode::Login;
-                self.log(LogLevel::Info, "No saved credentials — please log in");
+                self.log(LogLevel::Info, "No saved credentials in keychain — please log in");
             }
             Err(e) => {
                 self.mode = Mode::Login;
@@ -216,8 +262,12 @@ impl App {
     /// Drain all pending events from background tasks
     pub fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
+            if event.generation() != self.generation {
+                continue;
+            }
+
             match event {
-                AppEvent::VehicleState(state) => {
+                AppEvent::VehicleState { state, .. } => {
                     // Record to database
                     if let Some(db) = &self.db {
                         let vid = self
@@ -235,7 +285,7 @@ impl App {
                             }
                         }
                     }
-                    self.vehicle_state = Some(state);
+                    self.vehicle_state = Some(*state);
                     self.last_update = Some(Utc::now());
                     self.log(
                         LogLevel::Info,
@@ -245,9 +295,10 @@ impl App {
                         ),
                     );
                 }
-                AppEvent::AuthSuccess(tokens) => {
+                AppEvent::AuthSuccess { tokens, .. } => {
                     self.tokens = Some(tokens);
                     self.mfa_state = None;
+                    self.pending_vehicle_selection = None;
                     self.mode = Mode::Dashboard;
                     self.login_busy = false;
                     self.login_error = None;
@@ -255,7 +306,7 @@ impl App {
                     self.login_otp.clear();
                     self.log(LogLevel::Info, "Login successful — fetching vehicle state...");
                 }
-                AppEvent::MfaRequired(mfa) => {
+                AppEvent::MfaRequired { mfa, .. } => {
                     self.mfa_state = Some(mfa);
                     self.mode = Mode::MfaPrompt;
                     self.login_busy = false;
@@ -264,19 +315,27 @@ impl App {
                         "MFA required — enter the OTP code sent to your device",
                     );
                 }
-                AppEvent::Error(msg) => {
+                AppEvent::VehicleSelectionRequired { pending, .. } => {
+                    self.pending_vehicle_selection = Some(pending);
+                    self.login_busy = false;
+                    self.login_error = None;
+                    self.vehicle_selection_index = 0;
+                    self.mode = Mode::VehicleSelect;
+                    self.log(
+                        LogLevel::Info,
+                        "Multiple vehicles found — choose a vehicle to continue",
+                    );
+                }
+                AppEvent::Error { msg, .. } => {
                     self.login_busy = false;
                     self.login_error = Some(msg.clone());
                     self.log(LogLevel::Error, &msg);
                 }
-                AppEvent::Log(entry) => {
+                AppEvent::Log { entry, .. } => {
                     self.activity_log.push(entry);
-                    let visible = 10;
-                    if self.activity_log.len() > visible {
-                        self.log_scroll = self.activity_log.len() - visible;
-                    }
+                    self.focus_last_log();
                 }
-                AppEvent::RequestLog(req_log) => {
+                AppEvent::RequestLog { req_log, .. } => {
                     let status_str = req_log
                         .status
                         .map(|s| format!("{s}"))
@@ -322,7 +381,7 @@ impl App {
                         self.log(LogLevel::Info, &summary);
                     }
                 }
-                AppEvent::ChargingSessions(sessions) => {
+                AppEvent::ChargingSessions { sessions, .. } => {
                     if let Some(db) = &self.db {
                         match db.upsert_charging_sessions(&sessions) {
                             Ok(new) => {
@@ -352,6 +411,7 @@ impl App {
         if self.login_busy {
             return;
         }
+        self.generation += 1;
         self.login_busy = true;
         self.login_error = None;
         self.log(LogLevel::Info, "Logging in...");
@@ -360,33 +420,49 @@ impl App {
         let password = self.login_password.clone();
         let tx = self.event_tx.clone();
         let debug = self.debug;
+        let generation = self.generation;
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx) {
+            let client = match Self::make_client(debug, &tx, generation) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(e.to_string()));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: e.to_string(),
+                    });
                     return;
                 }
             };
             let auth_mgr = AuthManager::new(client);
 
-            let _ = tx.send(AppEvent::Log(LogEntry {
-                timestamp: Local::now(),
-                level: LogLevel::Info,
-                message: "Fetching CSRF token...".into(),
-                detail: None,
-            }));
+            let _ = tx.send(AppEvent::Log {
+                generation,
+                entry: LogEntry {
+                    timestamp: Local::now(),
+                    level: LogLevel::Info,
+                    message: "Fetching CSRF token...".into(),
+                    detail: None,
+                },
+            });
 
             match auth_mgr.login(&email, &password).await {
                 Ok(LoginOutcome::Success(tokens)) => {
-                    let _ = tx.send(AppEvent::AuthSuccess(tokens));
+                    let _ = tx.send(AppEvent::AuthSuccess { generation, tokens });
                 }
                 Ok(LoginOutcome::MfaRequired(mfa)) => {
-                    let _ = tx.send(AppEvent::MfaRequired(mfa));
+                    let _ = tx.send(AppEvent::MfaRequired { generation, mfa });
+                }
+                Ok(LoginOutcome::VehicleSelectionRequired(pending)) => {
+                    let _ = tx.send(AppEvent::VehicleSelectionRequired {
+                        generation,
+                        pending,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Login failed: {e}")));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Login failed: {e}"),
+                    });
                 }
             }
         });
@@ -407,23 +483,42 @@ impl App {
         let otp = self.login_otp.clone();
         let tx = self.event_tx.clone();
         let debug = self.debug;
+        let generation = self.generation;
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx) {
+            let client = match Self::make_client(debug, &tx, generation) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(e.to_string()));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: e.to_string(),
+                    });
                     return;
                 }
             };
             let auth_mgr = AuthManager::new(client);
 
             match auth_mgr.complete_mfa(&mfa, &otp).await {
-                Ok(tokens) => {
-                    let _ = tx.send(AppEvent::AuthSuccess(tokens));
+                Ok(LoginOutcome::Success(tokens)) => {
+                    let _ = tx.send(AppEvent::AuthSuccess { generation, tokens });
+                }
+                Ok(LoginOutcome::VehicleSelectionRequired(pending)) => {
+                    let _ = tx.send(AppEvent::VehicleSelectionRequired {
+                        generation,
+                        pending,
+                    });
+                }
+                Ok(LoginOutcome::MfaRequired(_)) => {
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: "OTP verification returned another MFA challenge".into(),
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("OTP failed: {e}")));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("OTP failed: {e}"),
+                    });
                 }
             }
         });
@@ -452,13 +547,17 @@ impl App {
         let headers = Self::auth_headers(tokens);
         let tx = self.event_tx.clone();
         let debug = self.debug;
+        let generation = self.generation;
         self.log(LogLevel::Info, "Fetching vehicle state...");
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx) {
+            let client = match Self::make_client(debug, &tx, generation) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(e.to_string()));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: e.to_string(),
+                    });
                     return;
                 }
             };
@@ -477,10 +576,27 @@ impl App {
 
             match result {
                 Ok(data) => {
-                    let _ = tx.send(AppEvent::VehicleState(data.vehicle_state));
+                    match data.vehicle_state {
+                        Some(state) => {
+                            let _ = tx.send(AppEvent::VehicleState {
+                                generation,
+                                state: Box::new(state),
+                            });
+                        }
+                        None => {
+                            let _ = tx.send(AppEvent::Error {
+                                generation,
+                                msg: "Poll failed: vehicle state was missing from the response"
+                                    .into(),
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Poll failed: {e}")));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Poll failed: {e}"),
+                    });
                 }
             }
         });
@@ -494,13 +610,17 @@ impl App {
         let headers = Self::auth_headers(tokens);
         let tx = self.event_tx.clone();
         let debug = self.debug;
+        let generation = self.generation;
         self.log(LogLevel::Info, "Fetching charging history...");
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx) {
+            let client = match Self::make_client(debug, &tx, generation) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Charging fetch failed: {e}")));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Charging fetch failed: {e}"),
+                    });
                     return;
                 }
             };
@@ -517,28 +637,108 @@ impl App {
 
             match result {
                 Ok(data) => {
-                    let _ = tx.send(AppEvent::ChargingSessions(
-                        data.get_completed_session_summaries,
-                    ));
+                    let _ = tx.send(AppEvent::ChargingSessions {
+                        generation,
+                        sessions: data.get_completed_session_summaries,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Charging history: {e}")));
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Charging history: {e}"),
+                    });
                 }
             }
         });
     }
 
+    pub fn cancel_auth_flow(&mut self) {
+        self.generation += 1;
+        self.login_busy = false;
+        self.login_error = None;
+        self.mfa_state = None;
+        self.pending_vehicle_selection = None;
+        self.login_otp.clear();
+        self.vehicle_selection_index = 0;
+        self.mode = Mode::Login;
+        self.log(LogLevel::Info, "Authentication canceled");
+    }
+
+    pub fn vehicle_options(&self) -> &[Vehicle] {
+        self.pending_vehicle_selection
+            .as_ref()
+            .map(|pending| pending.vehicles.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn select_vehicle_up(&mut self) {
+        self.vehicle_selection_index = self.vehicle_selection_index.saturating_sub(1);
+    }
+
+    pub fn select_vehicle_down(&mut self) {
+        let max = self.vehicle_options().len().saturating_sub(1);
+        if self.vehicle_selection_index < max {
+            self.vehicle_selection_index += 1;
+        }
+    }
+
+    pub fn confirm_vehicle_selection(&mut self) {
+        let Some(pending) = self.pending_vehicle_selection.clone() else {
+            return;
+        };
+        let Some(vehicle) = pending
+            .vehicles
+            .get(self.vehicle_selection_index)
+            .cloned()
+        else {
+            return;
+        };
+
+        let tokens = pending.into_tokens(vehicle.id.clone());
+        match AuthManager::save_tokens(&tokens) {
+            Ok(()) => {
+                self.tokens = Some(tokens);
+                self.pending_vehicle_selection = None;
+                self.mode = Mode::Dashboard;
+                self.login_error = None;
+                self.login_password.clear();
+                self.login_otp.clear();
+                self.log(
+                    LogLevel::Info,
+                    &format!(
+                        "Selected vehicle {}",
+                        vehicle.name.unwrap_or(vehicle.id)
+                    ),
+                );
+                self.poll_vehicle_state();
+                self.fetch_charging_history();
+            }
+            Err(e) => {
+                self.login_error = Some(format!("Saving vehicle selection failed: {e}"));
+                self.log(
+                    LogLevel::Error,
+                    &format!("Saving vehicle selection failed: {e}"),
+                );
+            }
+        }
+    }
+
     /// Log out: clear tokens and reset state
     pub fn logout(&mut self) {
+        self.generation += 1;
         let _ = AuthManager::clear_tokens();
         self.tokens = None;
         self.vehicle_state = None;
         self.last_update = None;
         self.mfa_state = None;
+        self.pending_vehicle_selection = None;
         self.login_email.clear();
         self.login_password.clear();
         self.login_otp.clear();
         self.login_error = None;
+        self.login_busy = false;
+        self.vehicle_selection_index = 0;
+        self.show_debug_detail = false;
         self.mode = Mode::Login;
         self.log(LogLevel::Info, "Logged out");
     }
@@ -562,13 +762,79 @@ impl App {
     }
 
     pub fn scroll_log_up(&mut self) {
-        self.log_scroll = self.log_scroll.saturating_sub(1);
+        if self.activity_log.is_empty() {
+            return;
+        }
+
+        self.log_selected = self.log_selected.saturating_sub(1);
+        if self.log_selected < self.log_scroll {
+            self.log_scroll = self.log_selected;
+        }
     }
 
     pub fn scroll_log_down(&mut self) {
-        let max = self.activity_log.len().saturating_sub(1);
-        if self.log_scroll < max {
-            self.log_scroll += 1;
+        if self.activity_log.is_empty() {
+            return;
         }
+
+        let max = self.activity_log.len().saturating_sub(1);
+        if self.log_selected < max {
+            self.log_selected += 1;
+        }
+
+        let visible = 10;
+        if self.log_selected >= self.log_scroll + visible {
+            self.log_scroll = self.log_selected + 1 - visible;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::auth::AuthTestContext;
+
+    fn sample_tokens() -> AuthTokens {
+        AuthTokens {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            user_session_token: "ust".into(),
+            csrf_token: "csrf".into(),
+            app_session_token: "ast".into(),
+            vehicle_id: "vehicle".into(),
+        }
+    }
+
+    #[test]
+    fn ignores_stale_vehicle_state_events_after_logout() {
+        let _auth = AuthTestContext::new();
+        let mut app = App::new(false);
+        app.tokens = Some(sample_tokens());
+        let generation = app.generation;
+
+        app.logout();
+        app.event_tx
+            .send(AppEvent::VehicleState {
+                generation,
+                state: Box::new(VehicleStateFields::default()),
+            })
+            .unwrap();
+
+        app.drain_events();
+        assert!(app.vehicle_state.is_none());
+    }
+
+    #[test]
+    fn log_selection_moves_independently_from_scroll() {
+        let mut app = App::new(true);
+        for idx in 0..12 {
+            app.log(LogLevel::Info, &format!("log {idx}"));
+        }
+
+        let scroll = app.log_scroll;
+        app.scroll_log_up();
+
+        assert_eq!(app.log_scroll, scroll);
+        assert_eq!(app.log_selected, app.activity_log.len() - 2);
     }
 }

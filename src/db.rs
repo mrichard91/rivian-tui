@@ -12,6 +12,26 @@ pub struct Db {
     conn: Connection,
 }
 
+fn charging_session_dedupe_key(session: &ChargingSession) -> String {
+    if let Some(transaction_id) = session.transaction_id.as_deref() {
+        if !transaction_id.is_empty() {
+            return format!("txn:{transaction_id}");
+        }
+    }
+
+    format!(
+        "fallback:{}|{}|{}|{}|{}|{}|{}|{}",
+        session.vehicle_id.as_deref().unwrap_or(""),
+        session.start_instant.as_deref().unwrap_or(""),
+        session.end_instant.as_deref().unwrap_or(""),
+        session.charger_type.as_deref().unwrap_or(""),
+        session.vendor.as_deref().unwrap_or(""),
+        session.city.as_deref().unwrap_or(""),
+        session.total_energy_kwh.unwrap_or_default(),
+        session.range_added_km.unwrap_or_default(),
+    )
+}
+
 impl Db {
     pub fn open() -> Result<Self> {
         let path = Self::db_path()?;
@@ -145,6 +165,7 @@ impl Db {
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 fetched_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 transaction_id  TEXT UNIQUE,
+                dedupe_key      TEXT,
                 vehicle_id      TEXT,
                 vehicle_name    TEXT,
                 charger_type    TEXT,
@@ -181,7 +202,6 @@ impl Db {
             "service_mode TEXT", "trailer_status TEXT", "car_wash_mode TEXT",
         ];
         for col in &add_cols {
-            let name = col.split_whitespace().next().unwrap();
             let sql = format!("ALTER TABLE vehicle_state ADD COLUMN {col}");
             // Ignore "duplicate column" errors
             if let Err(e) = self.conn.execute_batch(&sql) {
@@ -191,6 +211,45 @@ impl Db {
                 }
             }
         }
+
+        if let Err(e) = self
+            .conn
+            .execute_batch("ALTER TABLE charging_sessions ADD COLUMN dedupe_key TEXT")
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+
+        self.conn.execute_batch(
+            "UPDATE charging_sessions
+             SET dedupe_key = CASE
+                 WHEN transaction_id IS NOT NULL AND transaction_id != '' THEN 'txn:' || transaction_id
+                 ELSE 'fallback:'
+                     || COALESCE(vehicle_id, '') || '|'
+                     || COALESCE(start_instant, '') || '|'
+                     || COALESCE(end_instant, '') || '|'
+                     || COALESCE(charger_type, '') || '|'
+                     || COALESCE(vendor, '') || '|'
+                     || COALESCE(city, '') || '|'
+                     || COALESCE(CAST(total_energy_kwh AS TEXT), '') || '|'
+                     || COALESCE(CAST(range_added_km AS TEXT), '')
+             END
+             WHERE dedupe_key IS NULL OR dedupe_key = '';
+
+             DELETE FROM charging_sessions
+             WHERE id NOT IN (
+                 SELECT MIN(id)
+                 FROM charging_sessions
+                 WHERE dedupe_key IS NOT NULL AND dedupe_key != ''
+                 GROUP BY dedupe_key
+             )
+             AND dedupe_key IS NOT NULL
+             AND dedupe_key != '';
+
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_cs_dedupe ON charging_sessions(dedupe_key);",
+        )?;
 
         Ok(())
     }
@@ -302,14 +361,15 @@ impl Db {
     pub fn upsert_charging_sessions(&self, sessions: &[ChargingSession]) -> Result<usize> {
         let mut new_count = 0;
         for s in sessions {
+            let dedupe_key = charging_session_dedupe_key(s);
             let result = self.conn.execute(
                 "INSERT OR IGNORE INTO charging_sessions (
-                    transaction_id, vehicle_id, vehicle_name, charger_type, vendor, city,
+                    transaction_id, dedupe_key, vehicle_id, vehicle_name, charger_type, vendor, city,
                     start_instant, end_instant, total_energy_kwh, range_added_km,
                     currency_code, paid_total, is_home_charger, is_public, is_roaming
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 rusqlite::params![
-                    s.transaction_id, s.vehicle_id, s.vehicle_name,
+                    s.transaction_id, dedupe_key, s.vehicle_id, s.vehicle_name,
                     s.charger_type, s.vendor, s.city,
                     s.start_instant, s.end_instant, s.total_energy_kwh, s.range_added_km,
                     s.currency_code, s.paid_total,
@@ -332,6 +392,7 @@ impl Db {
     }
 
     /// Get a reference to the underlying connection (for future chat/query use)
+    #[cfg(test)]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -393,5 +454,34 @@ mod tests {
     fn migrate_is_idempotent() {
         let db = make_test_db();
         db.migrate().unwrap(); // run again — should not error
+    }
+
+    #[test]
+    fn charging_sessions_without_transaction_id_are_deduped() {
+        let db = make_test_db();
+        let session = ChargingSession {
+            charger_type: Some("home".into()),
+            currency_code: Some("USD".into()),
+            paid_total: Some(0.0),
+            start_instant: Some("2026-03-19T10:00:00Z".into()),
+            end_instant: Some("2026-03-19T11:00:00Z".into()),
+            total_energy_kwh: Some(22.5),
+            range_added_km: Some(120.0),
+            city: Some("Irvine".into()),
+            transaction_id: None,
+            vehicle_id: Some("vehicle-1".into()),
+            vehicle_name: Some("R1T".into()),
+            vendor: Some("Home".into()),
+            is_roaming_network: Some(false),
+            is_public: Some(false),
+            is_home_charger: Some(true),
+        };
+
+        let inserted = db
+            .upsert_charging_sessions(&[session.clone(), session])
+            .unwrap();
+
+        assert_eq!(inserted, 1);
+        assert_eq!(db.charging_session_count().unwrap(), 1);
     }
 }

@@ -1,7 +1,7 @@
-/// GraphQL query/mutation strings for the Rivian API.
-///
-/// Query format verified against rivian-python-client and rivian-python-api.
-/// Variable naming: $vehicleID (capital D), type String!, argument `id:`.
+//! GraphQL query/mutation strings for the Rivian API.
+//!
+//! Query format verified against rivian-python-client and rivian-python-api.
+//! Variable naming: $vehicleID (capital D), type String!, argument `id:`.
 
 pub const CREATE_CSRF_TOKEN: &str = "mutation CreateCSRFToken { createCsrfToken { __typename csrfToken appSessionToken } }";
 

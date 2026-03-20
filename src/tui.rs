@@ -37,12 +37,66 @@ fn kv_pair(
     ])
 }
 
+fn status_color(value: &str) -> Color {
+    let value = value.to_ascii_lowercase();
+
+    if value.contains("open")
+        || value.contains("low")
+        || value.contains("fail")
+        || value.contains("error")
+        || value == "true"
+    {
+        Color::Red
+    } else if value.contains("unlock")
+        || value.contains("limited")
+        || value.contains("download")
+        || value.contains("install")
+        || value.contains("warning")
+    {
+        Color::Yellow
+    } else if value.contains("closed")
+        || value.contains("locked")
+        || value == "ok"
+        || value.contains("enabled")
+        || value.contains("normal")
+        || value.contains("success")
+        || value.contains("ready")
+    {
+        Color::Green
+    } else if value.contains("unknown")
+        || value.contains("signal")
+        || value.contains("not_")
+        || value.contains("inactive")
+        || value.contains("disabled")
+        || value.contains("off")
+        || value.contains("idle")
+        || value == "false"
+    {
+        Color::DarkGray
+    } else {
+        Color::White
+    }
+}
+
+fn bool_badge(flag: Option<bool>, true_label: &str, false_label: &str) -> (String, Color) {
+    match flag {
+        Some(true) => (true_label.into(), Color::Green),
+        Some(false) => (false_label.into(), Color::DarkGray),
+        None => ("—".into(), Color::DarkGray),
+    }
+}
+
+fn tagged_value(tag: &str, value: &str, color: Color) -> (String, Color) {
+    (format!("{tag}:{value}"), color)
+}
+
 /// Main draw dispatcher
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::Dashboard => draw_dashboard(frame, app),
         Mode::Login => draw_login(frame, app),
         Mode::MfaPrompt => draw_mfa(frame, app),
+        Mode::VehicleSelect => draw_vehicle_select(frame, app),
     }
 }
 
@@ -77,7 +131,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
 
     // Debug detail overlay
     if app.show_debug_detail {
-        if let Some(entry) = app.activity_log.get(app.log_scroll) {
+        if let Some(entry) = app.activity_log.get(app.log_selected) {
             if let Some(detail) = &entry.detail {
                 draw_debug_overlay(frame, area, detail);
             }
@@ -178,7 +232,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::VehicleStateFields) {
     let rows = Layout::vertical([
         Constraint::Length(5),
-        Constraint::Min(3),
+        Constraint::Min(6),
     ])
     .split(area);
 
@@ -210,13 +264,28 @@ fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
     // Charging
     const CW: usize = 10;
     let time_left = vs.time_to_full().unwrap_or_else(|| "—".into());
-    let capacity = vs.battery_capacity_kwh().map(|c| format!("{c:.1} kWh")).unwrap_or_else(|| "—".into());
+    let capacity = vs
+        .battery_capacity_kwh()
+        .map(|c| format!("{c:.1} kWh"))
+        .unwrap_or_else(|| "—".into());
+    let remote = bool_badge(vs.get_boolish(&vs.remote_charging_available), "ready", "off");
+    let thermal = vs.get_str(&vs.battery_hv_thermal_event);
+    let thermal_color = status_color(thermal);
+    let derate = vs.get_str(&vs.charger_derate_status);
+    let derate_color = if derate.eq_ignore_ascii_case("none") {
+        Color::DarkGray
+    } else {
+        status_color(derate)
+    };
 
     let lines = vec![
         kvw(CW, "State", vs.charger_state_str()),
         kvw(CW, "Charger", vs.charger_status_str()),
-        kvw(CW, "Time Left", &time_left),
-        kvw(CW, "Capacity", &capacity),
+        kv(CW, "Port", vs.get_str(&vs.charge_port_state), status_color(vs.get_str(&vs.charge_port_state))),
+        kv(CW, "Remote", &remote.0, remote.1),
+        kv(CW, "Thermal", thermal, thermal_color),
+        kv(CW, "Derate", derate, derate_color),
+        kvw(CW, "Time/Cap", &format!("{time_left} / {capacity}")),
     ];
 
     let charging = Paragraph::new(lines).block(
@@ -239,11 +308,24 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
         Color::Gray
     };
     let mileage = vs.mileage().map(|m| format!("{m:.0} mi")).unwrap_or_else(|| "—".into());
-    let cabin = vs.cabin_temp_f().map(|t| format!("{t:.1} F")).unwrap_or_else(|| "—".into());
+    let cabin = vs
+        .cabin_temp_f()
+        .map(|t| format!("{t:.1} F"))
+        .unwrap_or_else(|| "—".into());
+    let driver = vs
+        .driver_temp_f()
+        .map(|t| format!("{t:.1} F"))
+        .unwrap_or_else(|| "—".into());
     let precon = vs.get_str(&vs.cabin_preconditioning_status);
+    let precon_type = vs.get_str(&vs.cabin_preconditioning_type);
+    let defrost = vs.get_str(&vs.defrost_defog_status);
     let sw_heat = vs.get_str(&vs.steering_wheel_heat);
-    let seat_l = vs.get_str(&vs.seat_front_left_heat);
-    let seat_r = vs.get_str(&vs.seat_front_right_heat);
+    let seat_fl = vs.get_str(&vs.seat_front_left_heat);
+    let seat_fr = vs.get_str(&vs.seat_front_right_heat);
+    let seat_rl = vs.get_str(&vs.seat_rear_left_heat);
+    let seat_rr = vs.get_str(&vs.seat_rear_right_heat);
+    let vent_fl = vs.get_str(&vs.seat_front_left_vent);
+    let vent_fr = vs.get_str(&vs.seat_front_right_vent);
 
     let accel_cold = vs.get_f64(&vs.limited_accel_cold).unwrap_or(0.0);
     let regen_cold = vs.get_f64(&vs.limited_regen_cold).unwrap_or(0.0);
@@ -258,16 +340,25 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
         "None".into()
     };
     let cold_color = if cold_active { Color::Yellow } else { Color::Green };
+    let climate_summary = if precon_type != "unknown" {
+        format!("{precon} / {precon_type}")
+    } else {
+        precon.to_string()
+    };
+    let defrost_color = status_color(defrost);
 
     let lines = vec![
         kv(VW, "Power", power, power_color),
         kvw(VW, "Gear", vs.gear_str()),
         kvw(VW, "Mode", vs.drive_mode_str()),
         kvw(VW, "Odometer", &mileage),
-        kvw(VW, "Cabin", &cabin),
-        kvw(VW, "Precon", precon),
+        kvw(VW, "Cabin", &format!("{cabin} / Drv {driver}")),
+        kvw(VW, "Climate", &climate_summary),
+        kv(VW, "Defrost", defrost, defrost_color),
+        kvw(VW, "Seats F", &format!("{seat_fl}/{seat_fr}")),
+        kvw(VW, "Seats R", &format!("{seat_rl}/{seat_rr}")),
+        kvw(VW, "Vent", &format!("{vent_fl}/{vent_fr}")),
         kvw(VW, "Wheel", sw_heat),
-        kvw(VW, "Seats", &format!("{seat_l}/{seat_r}")),
         kv(VW, "Cold", &cold_str, cold_color),
     ];
 
@@ -283,48 +374,49 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
 /// Right column: doors, tires, OTA, status
 fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::VehicleStateFields) {
     let rows = Layout::vertical([
-        Constraint::Length(5),  // doors
-        Constraint::Length(4),  // tires
-        Constraint::Length(7),  // OTA
-        Constraint::Min(3),    // status
+        Constraint::Length(9), // access
+        Constraint::Min(11),   // system
     ])
     .split(area);
 
     const RW: usize = 8;
 
-    // --- Doors ---
-    let door_icon = |field: &Option<crate::api::types::StateValue>| -> (String, Color) {
+    // --- Access ---
+    let access_icon = |
+        closed: &Option<crate::api::types::StateValue>,
+        locked: &Option<crate::api::types::StateValue>,
+    | -> (String, Color) {
+        match (
+            closed.as_ref().and_then(|v| v.as_str()),
+            locked.as_ref().and_then(|v| v.as_str()),
+        ) {
+            (Some("open"), _) => ("OPEN".into(), Color::Red),
+            (Some("closed"), Some("locked")) => ("Shut+Lk".into(), Color::Green),
+            (Some("closed"), Some("unlocked")) => ("Shut+Un".into(), Color::Yellow),
+            (Some("closed"), _) => ("Shut".into(), Color::Green),
+            (Some(state), Some(lock)) => (format!("{state}/{lock}"), Color::Yellow),
+            (Some(state), None) => (state.into(), status_color(state)),
+            (None, Some(lock)) => (lock.into(), status_color(lock)),
+            (None, None) => ("—".into(), Color::DarkGray),
+        }
+    };
+
+    let window_icon = |field: &Option<crate::api::types::StateValue>| -> (String, Color) {
         match field.as_ref().and_then(|v| v.as_str()) {
             Some("closed") => ("Shut".into(), Color::Green),
             Some("open") => ("OPEN".into(), Color::Red),
-            Some(other) => (other.into(), Color::Yellow),
+            Some(other) => (other.into(), status_color(other)),
             None => ("—".into(), Color::DarkGray),
         }
     };
 
-    let fl = door_icon(&vs.door_front_left_closed);
-    let fr = door_icon(&vs.door_front_right_closed);
-    let rl = door_icon(&vs.door_rear_left_closed);
-    let rr = door_icon(&vs.door_rear_right_closed);
-    let frunk = door_icon(&vs.closure_frunk_closed);
-    let trunk = door_icon(&vs.closure_liftgate_closed);
+    let fl = access_icon(&vs.door_front_left_closed, &vs.door_front_left_locked);
+    let fr = access_icon(&vs.door_front_right_closed, &vs.door_front_right_locked);
+    let rl = access_icon(&vs.door_rear_left_closed, &vs.door_rear_left_locked);
+    let rr = access_icon(&vs.door_rear_right_closed, &vs.door_rear_right_locked);
+    let frunk = access_icon(&vs.closure_frunk_closed, &vs.closure_frunk_locked);
+    let trunk = access_icon(&vs.closure_liftgate_closed, &vs.closure_liftgate_locked);
 
-    let door_lines = vec![
-        kv_pair(RW, "Front", &fl, &fr),
-        kv_pair(RW, "Rear", &rl, &rr),
-        kv_pair(RW, "Frk/Trk", &frunk, &trunk),
-    ];
-    frame.render_widget(
-        Paragraph::new(door_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" Doors "),
-        ),
-        rows[0],
-    );
-
-    // --- Tires ---
     let tire_icon = |field: &Option<crate::api::types::StateValue>| -> (String, Color) {
         match field.as_ref().and_then(|v| v.as_str()) {
             Some("OK") => ("OK".into(), Color::Green),
@@ -334,73 +426,93 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
         }
     };
 
-    let tfl = tire_icon(&vs.tire_pressure_status_front_left);
-    let tfr = tire_icon(&vs.tire_pressure_status_front_right);
-    let trl = tire_icon(&vs.tire_pressure_status_rear_left);
-    let trr = tire_icon(&vs.tire_pressure_status_rear_right);
-
-    let tire_lines = vec![
-        kv_pair(RW, "Front", &tfl, &tfr),
-        kv_pair(RW, "Rear", &trl, &trr),
+    let access_lines = vec![
+        kv_pair(RW, "Front", &fl, &fr),
+        kv_pair(RW, "Rear", &rl, &rr),
+        kv_pair(RW, "Frk/Trk", &frunk, &trunk),
+        kv_pair(
+            RW,
+            "Tire F",
+            &tire_icon(&vs.tire_pressure_status_front_left),
+            &tire_icon(&vs.tire_pressure_status_front_right),
+        ),
+        kv_pair(
+            RW,
+            "Tire R",
+            &tire_icon(&vs.tire_pressure_status_rear_left),
+            &tire_icon(&vs.tire_pressure_status_rear_right),
+        ),
+        kv_pair(
+            RW,
+            "Win F",
+            &window_icon(&vs.window_front_left_closed),
+            &window_icon(&vs.window_front_right_closed),
+        ),
+        kv_pair(
+            RW,
+            "Win R",
+            &window_icon(&vs.window_rear_left_closed),
+            &window_icon(&vs.window_rear_right_closed),
+        ),
     ];
     frame.render_widget(
-        Paragraph::new(tire_lines).block(
+        Paragraph::new(access_lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" Tires "),
+                .title(" Access "),
         ),
-        rows[1],
+        rows[0],
     );
 
-    // --- OTA ---
+    // --- System ---
     let current = vs.get_str(&vs.ota_current_version);
     let available = vs.get_str(&vs.ota_available_version);
     let ota_status = vs.get_str(&vs.ota_status);
-    let last_result = vs.get_str(&vs.ota_current_status);
     let install_ready = vs.get_str(&vs.ota_install_ready);
+    let progress = vs
+        .ota_progress_summary()
+        .unwrap_or_else(|| "—".into());
+    let location = vs.location_summary().unwrap_or_else(|| "—".into());
+    let heading = vs.heading_summary().unwrap_or_else(|| "—".into());
+    let last_sync = vs.last_sync().unwrap_or("—");
+    let alarm = bool_badge(vs.get_boolish(&vs.alarm_sound_status), "on", "off");
+    let guard = vs.get_str(&vs.gear_guard_video_status);
+    let guard_color = status_color(guard);
+    let service = vs.get_str(&vs.service_mode);
+    let wash = vs.get_str(&vs.car_wash_mode);
+    let mode_left = tagged_value("Svc", service, status_color(service));
+    let mode_right = tagged_value("Wash", wash, status_color(wash));
 
     let has_update = available != "0.0.0" && available != "unknown" && available != current;
     let avail_color = if has_update { Color::Yellow } else { Color::DarkGray };
     let avail_str = if has_update { available } else { "up to date" };
 
-    let ota_lines = vec![
+    let system_lines = vec![
         kvw(RW, "Current", current),
         kv(RW, "Avail", avail_str, avail_color),
-        kvw(RW, "Status", ota_status),
-        kvw(RW, "Last", last_result),
+        kv(RW, "OTA", ota_status, status_color(ota_status)),
+        kvw(RW, "Prog", &progress),
         kvw(RW, "Ready", install_ready),
+        kvw(RW, "Sync", last_sync),
+        kvw(RW, "Loc", &location),
+        kvw(RW, "Head", &heading),
+        kv_pair(
+            RW,
+            "Guard/Alm",
+            &tagged_value("G", guard, guard_color),
+            &tagged_value("A", &alarm.0, alarm.1),
+        ),
+        kv_pair(RW, "Mode", &mode_left, &mode_right),
     ];
     frame.render_widget(
-        Paragraph::new(ota_lines).block(
+        Paragraph::new(system_lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(if has_update { Color::Yellow } else { Color::Cyan }))
-                .title(if has_update { " OTA UPDATE! " } else { " OTA " }),
+                .title(if has_update { " System / OTA " } else { " System " }),
         ),
-        rows[2],
-    );
-
-    // --- Status ---
-    let last_sync = vs.last_sync().unwrap_or("—");
-
-    let status_lines = vec![
-        kvw(RW, "Sync", last_sync),
-        kvw(RW, "Guard", vs.get_str(&vs.gear_guard_locked)),
-        kvw(RW, "Video", vs.get_str(&vs.gear_guard_video_status)),
-        kvw(RW, "Pet", vs.get_str(&vs.pet_mode_status)),
-        kvw(RW, "Wiper", vs.get_str(&vs.wiper_fluid_state)),
-        kvw(RW, "12V", vs.get_str(&vs.twelve_volt_battery_health)),
-        kvw(RW, "Trailer", vs.get_str(&vs.trailer_status)),
-    ];
-    frame.render_widget(
-        Paragraph::new(status_lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" Status "),
-        ),
-        rows[3],
+        rows[1],
     );
 }
 
@@ -445,7 +557,7 @@ fn draw_activity_log(frame: &mut Frame, area: Rect, app: &App) {
                 LogLevel::Debug => ("DEBUG", Color::Yellow),
             };
 
-            let is_selected = start + i == app.log_scroll && app.debug;
+            let is_selected = start + i == app.log_selected && app.debug;
             let has_detail = entry.detail.is_some();
 
             let mut spans = vec![
@@ -652,6 +764,77 @@ fn draw_mfa(frame: &mut Frame, app: &App) {
         )
     };
     frame.render_widget(Paragraph::new(Line::from(msg)), rows[5]);
+}
+
+fn draw_vehicle_select(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+
+    let popup = centered_rect(60, 14, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Select Vehicle ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(4),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Choose the vehicle this session should use")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White)),
+        rows[0],
+    );
+
+    let vehicles: Vec<Line> = app
+        .vehicle_options()
+        .iter()
+        .enumerate()
+        .map(|(idx, vehicle)| {
+            let selected = idx == app.vehicle_selection_index;
+            let label = vehicle.name.as_deref().unwrap_or(vehicle.id.as_str());
+            let style = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            Line::from(vec![
+                Span::styled(
+                    if selected { " > " } else { "   " },
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(label.to_string(), style),
+                Span::styled(
+                    format!("  [{}]", vehicle.id),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(vehicles), rows[2]);
+
+    let msg = if let Some(err) = &app.login_error {
+        Span::styled(format!("  {err}"), Style::default().fg(Color::Red))
+    } else {
+        Span::styled(
+            "  Up/Down:select  Enter:confirm  Esc:back",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    frame.render_widget(Paragraph::new(Line::from(msg)), rows[3]);
 }
 
 // ---------------------------------------------------------------------------

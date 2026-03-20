@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Authentication tokens stored in keychain
+/// Authentication tokens stored in the OS keychain
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthTokens {
     pub access_token: String,
@@ -33,6 +33,21 @@ pub struct GraphQlResponse<T> {
 pub struct GraphQlError {
     pub message: String,
     pub extensions: Option<serde_json::Value>,
+}
+
+impl GraphQlError {
+    pub fn display_message(&self) -> String {
+        let code = self
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code"))
+            .and_then(|code| code.as_str());
+
+        match code {
+            Some(code) => format!("{} ({code})", self.message),
+            None => self.message.clone(),
+        }
+    }
 }
 
 // --- CSRF ---
@@ -140,9 +155,10 @@ pub struct ChargingSession {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VehicleStateData {
-    pub vehicle_state: VehicleStateFields,
+    pub vehicle_state: Option<VehicleStateFields>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VehicleStateFields {
@@ -283,6 +299,7 @@ impl StateValue {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GnssLocation {
@@ -309,6 +326,21 @@ impl VehicleStateFields {
             .unwrap_or("unknown")
     }
 
+    pub fn get_boolish(&self, field: &Option<StateValue>) -> Option<bool> {
+        let value = field.as_ref()?;
+
+        match &value.value {
+            serde_json::Value::Bool(flag) => Some(*flag),
+            serde_json::Value::Number(num) => num.as_f64().map(|v| v != 0.0),
+            serde_json::Value::String(text) => match text.to_ascii_lowercase().as_str() {
+                "true" | "1" | "on" | "enabled" | "yes" => Some(true),
+                "false" | "0" | "off" | "disabled" | "no" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn battery_percent(&self) -> Option<f64> {
         self.get_f64(&self.battery_level)
     }
@@ -327,6 +359,11 @@ impl VehicleStateFields {
 
     pub fn cabin_temp_f(&self) -> Option<f64> {
         self.get_f64(&self.cabin_climate_interior_temperature)
+            .map(|c| c * 9.0 / 5.0 + 32.0)
+    }
+
+    pub fn driver_temp_f(&self) -> Option<f64> {
+        self.get_f64(&self.cabin_climate_driver_temperature)
             .map(|c| c * 9.0 / 5.0 + 32.0)
     }
 
@@ -377,6 +414,49 @@ impl VehicleStateFields {
             .and_then(|c| c.last_sync.as_deref())
     }
 
+    pub fn location_summary(&self) -> Option<String> {
+        let location = self.gnss_location.as_ref()?;
+        let lat = location.latitude?;
+        let lon = location.longitude?;
+        Some(format!("{lat:.3}, {lon:.3}"))
+    }
+
+    pub fn heading_summary(&self) -> Option<String> {
+        let degrees = self.get_f64(&self.gnss_bearing)?;
+        let cardinal = match (((degrees.rem_euclid(360.0) + 22.5) / 45.0).floor() as usize) % 8 {
+            0 => "N",
+            1 => "NE",
+            2 => "E",
+            3 => "SE",
+            4 => "S",
+            5 => "SW",
+            6 => "W",
+            _ => "NW",
+        };
+        Some(format!("{degrees:.0}° {cardinal}"))
+    }
+
+    pub fn ota_progress_summary(&self) -> Option<String> {
+        let install = self.get_f64(&self.ota_install_progress).filter(|v| *v > 0.0);
+        let download = self.get_f64(&self.ota_download_progress).filter(|v| *v > 0.0);
+
+        if let Some(progress) = install {
+            return Some(format!("install {progress:.0}%"));
+        }
+
+        if let Some(progress) = download {
+            return Some(format!("download {progress:.0}%"));
+        }
+
+        let install_type = self.get_str(&self.ota_install_type);
+        if install_type != "unknown" {
+            return Some(install_type.to_string());
+        }
+
+        None
+    }
+
+    #[cfg(test)]
     pub fn is_door_open(&self, door: &str) -> Option<bool> {
         let val = match door {
             "front_left" => &self.door_front_left_closed,
@@ -525,7 +605,7 @@ mod tests {
 
         let resp: GraphQlResponse<VehicleStateData> =
             serde_json::from_str(json).unwrap();
-        let vs = resp.data.unwrap().vehicle_state;
+        let vs = resp.data.unwrap().vehicle_state.unwrap();
 
         assert!((vs.battery_percent().unwrap() - 72.0).abs() < f64::EPSILON);
         // 198.5 km → miles
@@ -541,6 +621,7 @@ mod tests {
         assert!((vs.battery_capacity_kwh().unwrap() - 135.0).abs() < 0.01);
         assert_eq!(vs.time_to_full().unwrap(), "1h 30m");
         assert_eq!(vs.last_sync().unwrap(), "2026-03-19T06:00:00Z");
+        assert_eq!(vs.location_summary().as_deref(), Some("37.775, -122.419"));
 
         // cabin temp: 22.5 C → 72.5 F
         let temp_f = vs.cabin_temp_f().unwrap();
@@ -568,7 +649,7 @@ mod tests {
 
         let resp: GraphQlResponse<VehicleStateData> =
             serde_json::from_str(json).unwrap();
-        let vs = resp.data.unwrap().vehicle_state;
+        let vs = resp.data.unwrap().vehicle_state.unwrap();
 
         assert!((vs.battery_percent().unwrap() - 55.0).abs() < f64::EPSILON);
         // 150.0 km → miles
@@ -594,7 +675,7 @@ mod tests {
 
         let resp: GraphQlResponse<VehicleStateData> =
             serde_json::from_str(json).unwrap();
-        let vs = resp.data.unwrap().vehicle_state;
+        let vs = resp.data.unwrap().vehicle_state.unwrap();
 
         assert!((vs.battery_percent().unwrap() - 72.0).abs() < 0.01);
         assert!((vs.mileage().unwrap() - 12500.3 / 1609.344).abs() < 0.01);

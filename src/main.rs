@@ -6,7 +6,7 @@ mod tui;
 use std::io;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
@@ -214,9 +214,7 @@ async fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, cli: &Cl
                                     app.show_log = !app.show_log;
                                 }
                                 KeyCode::Char('d') if app.debug => {
-                                    if let Some(entry) =
-                                        app.activity_log.get(app.log_scroll)
-                                    {
+                                    if let Some(entry) = app.activity_log.get(app.log_selected) {
                                         if entry.detail.is_some() {
                                             app.show_debug_detail = true;
                                         }
@@ -248,9 +246,7 @@ async fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, cli: &Cl
                         app.login_field = app::LoginField::Otp;
                         match key.code {
                             KeyCode::Esc => {
-                                app.mode = Mode::Login;
-                                app.mfa_state = None;
-                                app.login_otp.clear();
+                                app.cancel_auth_flow();
                             }
                             KeyCode::Enter => {
                                 app.submit_otp();
@@ -264,6 +260,21 @@ async fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, cli: &Cl
                             _ => {}
                         }
                     }
+                    Mode::VehicleSelect => match key.code {
+                        KeyCode::Esc => {
+                            app.cancel_auth_flow();
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            app.select_vehicle_down();
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.select_vehicle_up();
+                        }
+                        KeyCode::Enter => {
+                            app.confirm_vehicle_selection();
+                        }
+                        _ => {}
+                    },
                 }
 
                 if app.should_quit {
