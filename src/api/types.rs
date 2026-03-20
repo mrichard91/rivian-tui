@@ -367,6 +367,14 @@ impl VehicleStateFields {
             .map(|c| c * 9.0 / 5.0 + 32.0)
     }
 
+    pub fn speed_mph(&self) -> Option<f64> {
+        self.get_f64(&self.gnss_speed).map(|kmh| kmh / 1.60934)
+    }
+
+    pub fn altitude_ft(&self) -> Option<f64> {
+        self.get_f64(&self.gnss_altitude).map(|meters| meters * 3.28084)
+    }
+
     pub fn power_state_str(&self) -> &str {
         self.get_str(&self.power_state)
     }
@@ -454,6 +462,12 @@ impl VehicleStateFields {
         }
 
         None
+    }
+
+    pub fn is_actively_charging(&self) -> bool {
+        let state = self.charger_state_str().to_ascii_lowercase();
+        let status = self.charger_status_str().to_ascii_lowercase();
+        state.contains("active") || status.contains("charging")
     }
 
     #[cfg(test)]

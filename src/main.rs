@@ -15,7 +15,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
-use api::auth::AuthManager;
+use api::auth::{AuthManager, authenticated_headers};
 use api::client::{GATEWAY_URL, RivianClient};
 use api::queries;
 use app::{App, Mode};
@@ -75,13 +75,7 @@ async fn run_stdout(cli: &Cli) -> Result<()> {
 
     let client = RivianClient::new()?;
 
-    let headers = vec![
-        ("Authorization", format!("Bearer {}", tokens.access_token)),
-        ("Csrf-Token", tokens.csrf_token.clone()),
-        ("A-Sess", tokens.app_session_token.clone()),
-        ("U-Sess", tokens.user_session_token.clone()),
-        ("Dc-Cid", format!("m-ios-{}", uuid::Uuid::new_v4())),
-    ];
+    let headers = authenticated_headers(&tokens);
 
     let (op_name, query_str, variables) = if let Some(custom_query) = &cli.query {
         // Auto-pass vehicleID variable if query declares it

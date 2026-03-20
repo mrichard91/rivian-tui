@@ -12,6 +12,27 @@ pub struct Db {
     conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub struct VehicleTrendPoint {
+    pub battery_level: Option<f64>,
+    pub range_km: Option<f64>,
+    pub vehicle_mileage_m: Option<f64>,
+    pub speed_kmh: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChargeSessionSummary {
+    pub start_instant: Option<String>,
+    pub end_instant: Option<String>,
+    pub total_energy_kwh: Option<f64>,
+    pub range_added_km: Option<f64>,
+    pub vendor: Option<String>,
+    pub city: Option<String>,
+    pub charger_type: Option<String>,
+    pub is_public: Option<bool>,
+    pub is_home_charger: Option<bool>,
+}
+
 fn charging_session_dedupe_key(session: &ChargingSession) -> String {
     if let Some(transaction_id) = session.transaction_id.as_deref() {
         if !transaction_id.is_empty() {
@@ -188,6 +209,7 @@ impl Db {
 
         // Add columns that may not exist in older DBs
         let add_cols = [
+            "distance_to_empty_km REAL",
             "charge_port_state TEXT", "charger_derate TEXT", "remote_charging_available REAL",
             "battery_hv_thermal TEXT", "driver_temp_c REAL", "preconditioning_type TEXT",
             "seat_heat_rl TEXT", "seat_heat_rr TEXT", "seat_vent_fl TEXT", "seat_vent_fr TEXT",
@@ -391,6 +413,68 @@ impl Db {
         Ok(count)
     }
 
+    pub fn recent_vehicle_trend(
+        &self,
+        vehicle_id: &str,
+        limit: usize,
+    ) -> Result<Vec<VehicleTrendPoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT battery_level, distance_to_empty_km, vehicle_mileage_m, speed
+             FROM vehicle_state
+             WHERE vehicle_id = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+
+        let mut points: Vec<VehicleTrendPoint> = stmt
+            .query_map((vehicle_id, limit as i64), |row| {
+                Ok(VehicleTrendPoint {
+                    battery_level: row.get(0)?,
+                    range_km: row.get(1)?,
+                    vehicle_mileage_m: row.get(2)?,
+                    speed_kmh: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        points.reverse();
+        Ok(points)
+    }
+
+    pub fn latest_charging_session(
+        &self,
+        vehicle_id: &str,
+    ) -> Result<Option<ChargeSessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT start_instant, end_instant, total_energy_kwh, range_added_km,
+                    vendor, city, charger_type, is_public, is_home_charger
+             FROM charging_sessions
+             WHERE vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = ''
+             ORDER BY COALESCE(end_instant, start_instant, fetched_at) DESC
+             LIMIT 1",
+        )?;
+
+        let result = stmt.query_row([vehicle_id], |row| {
+            Ok(ChargeSessionSummary {
+                start_instant: row.get(0)?,
+                end_instant: row.get(1)?,
+                total_energy_kwh: row.get(2)?,
+                range_added_km: row.get(3)?,
+                vendor: row.get(4)?,
+                city: row.get(5)?,
+                charger_type: row.get(6)?,
+                is_public: row.get(7)?,
+                is_home_charger: row.get(8)?,
+            })
+        });
+
+        match result {
+            Ok(summary) => Ok(Some(summary)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Get a reference to the underlying connection (for future chat/query use)
     #[cfg(test)]
     pub fn conn(&self) -> &Connection {
@@ -483,5 +567,103 @@ mod tests {
 
         assert_eq!(inserted, 1);
         assert_eq!(db.charging_session_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_vehicle_trend_returns_oldest_to_newest() {
+        let db = make_test_db();
+
+        for (battery, range, mileage) in [(75.0, 320.0, 1000.0), (74.0, 315.0, 1010.0), (73.5, 312.0, 1020.0)] {
+            let json = format!(
+                r#"{{
+                    "batteryLevel": {{ "value": {battery} }},
+                    "distanceToEmpty": {{ "value": {range} }},
+                    "vehicleMileage": {{ "value": {mileage} }}
+                }}"#
+            );
+            let vs: VehicleStateFields = serde_json::from_str(&json).unwrap();
+            db.insert_state("VIN123", &vs).unwrap();
+        }
+
+        let trend = db.recent_vehicle_trend("VIN123", 3).unwrap();
+        assert_eq!(trend.len(), 3);
+        assert_eq!(trend.first().and_then(|p| p.battery_level), Some(75.0));
+        assert_eq!(trend.last().and_then(|p| p.battery_level), Some(73.5));
+    }
+
+    #[test]
+    fn latest_charging_session_returns_most_recent_row() {
+        let db = make_test_db();
+
+        let older = ChargingSession {
+            charger_type: Some("AC".into()),
+            currency_code: Some("USD".into()),
+            paid_total: Some(0.0),
+            start_instant: Some("2026-03-18T10:00:00Z".into()),
+            end_instant: Some("2026-03-18T11:00:00Z".into()),
+            total_energy_kwh: Some(12.0),
+            range_added_km: Some(55.0),
+            city: Some("Austin".into()),
+            transaction_id: Some("txn-1".into()),
+            vehicle_id: Some("vehicle-1".into()),
+            vehicle_name: Some("R1T".into()),
+            vendor: Some("Home".into()),
+            is_roaming_network: Some(false),
+            is_public: Some(false),
+            is_home_charger: Some(true),
+        };
+        let newer = ChargingSession {
+            transaction_id: Some("txn-2".into()),
+            end_instant: Some("2026-03-19T11:00:00Z".into()),
+            start_instant: Some("2026-03-19T10:00:00Z".into()),
+            total_energy_kwh: Some(18.0),
+            range_added_km: Some(80.0),
+            city: Some("Denver".into()),
+            vendor: Some("Rivian".into()),
+            charger_type: Some("RAN".into()),
+            vehicle_id: Some("vehicle-1".into()),
+            vehicle_name: Some("R1T".into()),
+            currency_code: Some("USD".into()),
+            paid_total: Some(5.0),
+            is_roaming_network: Some(false),
+            is_public: Some(true),
+            is_home_charger: Some(false),
+        };
+
+        db.upsert_charging_sessions(&[older, newer]).unwrap();
+
+        let latest = db.latest_charging_session("vehicle-1").unwrap().unwrap();
+        assert_eq!(latest.vendor.as_deref(), Some("Rivian"));
+        assert_eq!(latest.city.as_deref(), Some("Denver"));
+    }
+
+    #[test]
+    fn migrate_adds_distance_to_empty_km_to_legacy_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vehicle_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                vehicle_id TEXT,
+                power_state TEXT,
+                drive_mode TEXT,
+                gear_status TEXT,
+                vehicle_mileage_m REAL,
+                battery_level REAL,
+                battery_limit REAL,
+                battery_capacity REAL,
+                charger_status TEXT,
+                charger_state TEXT,
+                time_to_end_of_charge REAL
+            );",
+        )
+        .unwrap();
+
+        let db = Db { conn };
+        db.migrate().unwrap();
+        assert!(db
+            .conn()
+            .prepare("SELECT distance_to_empty_km FROM vehicle_state LIMIT 1")
+            .is_ok());
     }
 }

@@ -65,6 +65,20 @@ impl PendingVehicleSelection {
     }
 }
 
+/// Build the authenticated session headers used for saved-session API calls.
+///
+/// Rivian's saved access tokens can expire while the app and user session tokens
+/// remain valid, so dashboard polling should rely on the session headers instead
+/// of sending a potentially stale bearer token.
+pub fn authenticated_headers(tokens: &AuthTokens) -> Vec<(&'static str, String)> {
+    vec![
+        ("Csrf-Token", tokens.csrf_token.clone()),
+        ("A-Sess", tokens.app_session_token.clone()),
+        ("U-Sess", tokens.user_session_token.clone()),
+        ("Dc-Cid", format!("m-ios-{}", uuid::Uuid::new_v4())),
+    ]
+}
+
 impl AuthManager {
     pub fn new(client: RivianClient) -> Self {
         Self { client }
@@ -480,6 +494,24 @@ mod tests {
         let tokens = pending.into_tokens("test-vid".into());
         assert_eq!(tokens.access_token, "test-at");
         assert_eq!(tokens.vehicle_id, "test-vid");
+    }
+
+    #[test]
+    fn authenticated_headers_use_session_tokens_only() {
+        let headers = authenticated_headers(&AuthTokens {
+            access_token: "test-at".into(),
+            refresh_token: "test-rt".into(),
+            user_session_token: "test-ust".into(),
+            csrf_token: "test-csrf".into(),
+            app_session_token: "test-ast".into(),
+            vehicle_id: "test-vid".into(),
+        });
+
+        assert!(headers.iter().any(|(k, _)| *k == "Csrf-Token"));
+        assert!(headers.iter().any(|(k, _)| *k == "A-Sess"));
+        assert!(headers.iter().any(|(k, _)| *k == "U-Sess"));
+        assert!(headers.iter().any(|(k, _)| *k == "Dc-Cid"));
+        assert!(!headers.iter().any(|(k, _)| *k == "Authorization"));
     }
 
     #[test]

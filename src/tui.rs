@@ -90,6 +90,13 @@ fn tagged_value(tag: &str, value: &str, color: Color) -> (String, Color) {
     (format!("{tag}:{value}"), color)
 }
 
+const R1T_ART: [&str; 4] = [
+    "        _____________        ",
+    " _____ /_|___|___|___\\___    ",
+    "|  _  _   R1T          _ \\   ",
+    "'-(_)-'--------------'-(_)-' ",
+];
+
 /// Main draw dispatcher
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
@@ -216,16 +223,41 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
+    let alerts = collect_alerts(vs);
+    let mut body_constraints = Vec::new();
+    if !alerts.is_empty() {
+        body_constraints.push(Constraint::Length(3));
+    }
+    body_constraints.push(Constraint::Min(12));
+    body_constraints.push(Constraint::Length(9));
+
+    let sections = Layout::vertical(body_constraints).split(area);
+    let mut section_idx = 0;
+
+    if !alerts.is_empty() {
+        draw_alert_strip(frame, sections[section_idx], &alerts);
+        section_idx += 1;
+    }
+
     let cols = Layout::horizontal([
         Constraint::Percentage(33),
         Constraint::Percentage(34),
         Constraint::Percentage(33),
     ])
-    .split(area);
+    .split(sections[section_idx]);
 
     draw_col_battery(frame, cols[0], vs);
     draw_col_vehicle(frame, cols[1], vs);
     draw_col_status(frame, cols[2], vs);
+
+    let insights = Layout::horizontal([
+        Constraint::Percentage(60),
+        Constraint::Percentage(40),
+    ])
+    .split(sections[section_idx + 1]);
+
+    draw_trend_panel(frame, insights[0], app, vs);
+    draw_charge_insights(frame, insights[1], app, vs);
 }
 
 /// Left column: battery gauge + charging
@@ -300,6 +332,12 @@ fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
 /// Middle column: vehicle info
 fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::VehicleStateFields) {
     const VW: usize = 10;
+    let show_art = area.width >= 30 && area.height >= 16;
+    let sections = if show_art {
+        Layout::vertical([Constraint::Length(5), Constraint::Min(8)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Min(8)]).split(area)
+    };
 
     let power = vs.power_state_str();
     let power_color = if power == "ready" || power == "go" {
@@ -362,13 +400,37 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
         kv(VW, "Cold", &cold_str, cold_color),
     ];
 
+    if show_art {
+        let art: Vec<Line> = R1T_ART
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    *line,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(art)
+                .alignment(Alignment::Center)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan))
+                        .title(" R1T "),
+                ),
+            sections[0],
+        );
+    }
+
     let panel = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(" Vehicle "),
     );
-    frame.render_widget(panel, area);
+    frame.render_widget(panel, sections[sections.len() - 1]);
 }
 
 /// Right column: doors, tires, OTA, status
@@ -513,6 +575,336 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
                 .title(if has_update { " System / OTA " } else { " System " }),
         ),
         rows[1],
+    );
+}
+
+fn collect_alerts(vs: &crate::api::types::VehicleStateFields) -> Vec<(String, Color)> {
+    let mut alerts = Vec::new();
+
+    let door_fields = [
+        &vs.door_front_left_closed,
+        &vs.door_front_right_closed,
+        &vs.door_rear_left_closed,
+        &vs.door_rear_right_closed,
+        &vs.closure_frunk_closed,
+        &vs.closure_liftgate_closed,
+    ];
+    if door_fields.iter().any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open"))) {
+        alerts.push(("Door or hatch open".into(), Color::Red));
+    }
+
+    let window_fields = [
+        &vs.window_front_left_closed,
+        &vs.window_front_right_closed,
+        &vs.window_rear_left_closed,
+        &vs.window_rear_right_closed,
+    ];
+    if window_fields.iter().any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open"))) {
+        alerts.push(("Window open".into(), Color::Red));
+    }
+
+    let tire_fields = [
+        &vs.tire_pressure_status_front_left,
+        &vs.tire_pressure_status_front_right,
+        &vs.tire_pressure_status_rear_left,
+        &vs.tire_pressure_status_rear_right,
+    ];
+    if tire_fields.iter().any(|field| {
+        field
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_ascii_lowercase().contains("low"))
+            .unwrap_or(false)
+    }) {
+        alerts.push(("Low tire pressure".into(), Color::Red));
+    }
+
+    if vs.get_f64(&vs.limited_accel_cold).unwrap_or(0.0) > 0.0
+        || vs.get_f64(&vs.limited_regen_cold).unwrap_or(0.0) > 0.0
+    {
+        alerts.push(("Cold-limited accel/regen".into(), Color::Yellow));
+    }
+
+    let available = vs.get_str(&vs.ota_available_version);
+    let current = vs.get_str(&vs.ota_current_version);
+    if available != "0.0.0" && available != "unknown" && available != current {
+        alerts.push((format!("OTA available {available}"), Color::Yellow));
+    }
+
+    let battery_12v = vs.get_str(&vs.twelve_volt_battery_health);
+    if battery_12v != "unknown" && battery_12v != "NORMAL_OPERATION" {
+        alerts.push((format!("12V {battery_12v}"), Color::Yellow));
+    }
+
+    for (label, field) in [
+        ("Service mode", &vs.service_mode),
+        ("Car wash mode", &vs.car_wash_mode),
+        ("Pet mode", &vs.pet_mode_status),
+    ] {
+        let value = vs.get_str(field);
+        if !matches!(value, "unknown" | "off" | "Disabled") {
+            alerts.push((label.into(), Color::Yellow));
+        }
+    }
+
+    alerts
+}
+
+fn draw_alert_strip(frame: &mut Frame, area: Rect, alerts: &[(String, Color)]) {
+    let mut spans = vec![Span::styled(
+        " Alerts ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )];
+
+    for (idx, (message, color)) in alerts.iter().enumerate() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(message.clone(), Style::default().fg(*color)));
+        if idx + 1 != alerts.len() {
+            spans.push(Span::styled(" • ", Style::default().fg(Color::DarkGray)));
+        }
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans))
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        );
+    frame.render_widget(paragraph, area);
+}
+
+fn trend_delta(app: &App) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    let first = app.recent_trend.first();
+    let last = app.recent_trend.last();
+
+    let battery = first
+        .and_then(|point| point.battery_level)
+        .zip(last.and_then(|point| point.battery_level))
+        .map(|(start, end)| end - start);
+    let range = first
+        .and_then(|point| point.range_km)
+        .zip(last.and_then(|point| point.range_km))
+        .map(|(start, end)| (end - start) / 1.60934);
+    let mileage = first
+        .and_then(|point| point.vehicle_mileage_m)
+        .zip(last.and_then(|point| point.vehicle_mileage_m))
+        .map(|(start, end)| (end - start) / 1609.344);
+    let peak_speed = app
+        .recent_trend
+        .iter()
+        .filter_map(|point| point.speed_kmh)
+        .fold(None, |acc: Option<f64>, speed| {
+            Some(acc.map_or(speed, |current| current.max(speed)))
+        })
+        .map(|kmh| kmh / 1.60934);
+
+    (battery, range, mileage, peak_speed)
+}
+
+fn sparkline_data(values: impl Iterator<Item = Option<f64>>, scale: f64) -> Vec<u64> {
+    values
+        .map(|value| (value.unwrap_or_default().max(0.0) * scale) as u64)
+        .collect()
+}
+
+fn draw_trend_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    vs: &crate::api::types::VehicleStateFields,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Trends ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.recent_trend.len() < 2 {
+        frame.render_widget(
+            Paragraph::new("  Waiting for more snapshots...")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let (battery_delta, range_delta, mileage_delta, peak_speed) = trend_delta(app);
+    let summary = format!(
+        "  {} snaps  ΔSOC {:+.1}%  ΔRange {:+.1} mi  ΔODO {:+.1} mi",
+        app.recent_trend.len(),
+        battery_delta.unwrap_or_default(),
+        range_delta.unwrap_or_default(),
+        mileage_delta.unwrap_or_default(),
+    );
+    frame.render_widget(
+        Paragraph::new(summary).style(Style::default().fg(Color::White)),
+        rows[0],
+    );
+
+    let battery_data = sparkline_data(app.recent_trend.iter().map(|point| point.battery_level), 10.0);
+    let range_data = sparkline_data(app.recent_trend.iter().map(|point| point.range_km), 1.0);
+
+    frame.render_widget(
+        Sparkline::default()
+            .block(Block::default().title(" SOC "))
+            .data(&battery_data)
+            .style(Style::default().fg(Color::Green)),
+        rows[1],
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .block(Block::default().title(" Range km "))
+            .data(&range_data)
+            .style(Style::default().fg(Color::Yellow)),
+        rows[2],
+    );
+
+    let motion = format!(
+        "  Now {:.0} mph  Peak {:.0} mph  Alt {:.0} ft",
+        vs.speed_mph().unwrap_or_default(),
+        peak_speed.unwrap_or_default(),
+        vs.altitude_ft().unwrap_or_default(),
+    );
+    frame.render_widget(
+        Paragraph::new(motion).style(Style::default().fg(Color::DarkGray)),
+        rows[3],
+    );
+}
+
+fn format_charge_kind(session: &crate::db::ChargeSessionSummary) -> String {
+    if session.is_home_charger == Some(true) {
+        "home".into()
+    } else if session.is_public == Some(true) {
+        "public".into()
+    } else {
+        session
+            .charger_type
+            .clone()
+            .unwrap_or_else(|| "unknown".into())
+    }
+}
+
+fn format_charge_time(session: &crate::db::ChargeSessionSummary) -> String {
+    session
+        .end_instant
+        .as_deref()
+        .or(session.start_instant.as_deref())
+        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%b %d %H:%M").to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn draw_charge_insights(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    vs: &crate::api::types::VehicleStateFields,
+) {
+    const W: usize = 9;
+    let active = vs.is_actively_charging();
+    let title = if active { " Charge Live " } else { " Charge Summary " };
+    let border = if active { Color::Green } else { Color::Cyan };
+
+    let rows = if active {
+        let (battery_delta, range_delta, _, _) = trend_delta(app);
+        vec![
+            kv(W, "State", vs.charger_state_str(), status_color(vs.charger_state_str())),
+            kvw(W, "Status", vs.charger_status_str()),
+            kvw(
+                W,
+                "SOC",
+                &format!(
+                    "{:.0}% / {:.0} mi",
+                    vs.battery_percent().unwrap_or_default(),
+                    vs.range_miles().unwrap_or_default()
+                ),
+            ),
+            kvw(
+                W,
+                "Time",
+                &vs.time_to_full().unwrap_or_else(|| "—".into()),
+            ),
+            kvw(
+                W,
+                "Trend",
+                &format!(
+                    "ΔSOC {:+.1}%  ΔMi {:+.1}",
+                    battery_delta.unwrap_or_default(),
+                    range_delta.unwrap_or_default()
+                ),
+            ),
+            kvw(
+                W,
+                "Where",
+                &vs.location_summary().unwrap_or_else(|| "—".into()),
+            ),
+        ]
+    } else if let Some(session) = &app.last_charge_session {
+        vec![
+            kvw(
+                W,
+                "When",
+                &format_charge_time(session),
+            ),
+            kvw(
+                W,
+                "Energy",
+                &session
+                    .total_energy_kwh
+                    .map(|value| format!("{value:.1} kWh"))
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            kvw(
+                W,
+                "Range",
+                &session
+                    .range_added_km
+                    .map(|value| format!("{:.0} mi", value / 1.60934))
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            kvw(
+                W,
+                "Site",
+                &session
+                    .vendor
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+            kvw(
+                W,
+                "City",
+                &session.city.clone().unwrap_or_else(|| "—".into()),
+            ),
+            kvw(W, "Type", &format_charge_kind(session)),
+        ]
+    } else {
+        vec![
+            kvw(W, "Last", "No session data"),
+            kvw(W, "Hint", "Fetch after next sync"),
+        ]
+    };
+
+    frame.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .title(title),
+        ),
+        area,
     );
 }
 

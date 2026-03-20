@@ -1,11 +1,13 @@
 use chrono::{DateTime, Local, Utc};
 use tokio::sync::mpsc;
 
-use crate::api::auth::{AuthManager, LoginOutcome, PendingVehicleSelection};
+use crate::api::auth::{
+    AuthManager, LoginOutcome, PendingVehicleSelection, authenticated_headers,
+};
 use crate::api::client::{API_URL, CHARGING_URL, RequestLog, RivianClient};
 use crate::api::queries;
 use crate::api::types::*;
-use crate::db::Db;
+use crate::db::{ChargeSessionSummary, Db, VehicleTrendPoint};
 
 /// UI mode / active screen
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +114,8 @@ pub struct App {
 
     // Vehicle data
     pub vehicle_state: Option<VehicleStateFields>,
+    pub recent_trend: Vec<VehicleTrendPoint>,
+    pub last_charge_session: Option<ChargeSessionSummary>,
     pub last_update: Option<DateTime<Utc>>,
     pub poll_interval_secs: u64,
 
@@ -153,6 +157,8 @@ impl App {
             vehicle_selection_index: 0,
 
             vehicle_state: None,
+            recent_trend: Vec::new(),
+            last_charge_session: None,
             last_update: None,
             poll_interval_secs: 300,
 
@@ -225,6 +231,40 @@ impl App {
         self.focus_last_log();
     }
 
+    fn refresh_dashboard_insights(&mut self) {
+        let Some(vehicle_id) = self.tokens.as_ref().map(|tokens| tokens.vehicle_id.clone()) else {
+            self.recent_trend.clear();
+            self.last_charge_session = None;
+            return;
+        };
+        let Some(db) = &self.db else {
+            self.recent_trend.clear();
+            self.last_charge_session = None;
+            return;
+        };
+
+        let trend_result = db.recent_vehicle_trend(&vehicle_id, 24);
+        let charge_result = db.latest_charging_session(&vehicle_id);
+
+        match trend_result {
+            Ok(points) => {
+                self.recent_trend = points;
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, &format!("Trend load failed: {e}"));
+            }
+        }
+
+        match charge_result {
+            Ok(session) => {
+                self.last_charge_session = session;
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, &format!("Charge summary load failed: {e}"));
+            }
+        }
+    }
+
     /// Initialize database and load auth tokens on startup
     pub fn try_load_auth(&mut self) {
         match Db::open() {
@@ -243,6 +283,7 @@ impl App {
             Ok(Some(tokens)) => {
                 let vid = tokens.vehicle_id.clone();
                 self.tokens = Some(tokens);
+                self.refresh_dashboard_insights();
                 self.log(
                     LogLevel::Info,
                     &format!("Loaded credentials (vehicle: {vid})"),
@@ -286,6 +327,7 @@ impl App {
                         }
                     }
                     self.vehicle_state = Some(*state);
+                    self.refresh_dashboard_insights();
                     self.last_update = Some(Utc::now());
                     self.log(
                         LogLevel::Info,
@@ -304,6 +346,7 @@ impl App {
                     self.login_error = None;
                     self.login_password.clear();
                     self.login_otp.clear();
+                    self.refresh_dashboard_insights();
                     self.log(LogLevel::Info, "Login successful — fetching vehicle state...");
                 }
                 AppEvent::MfaRequired { mfa, .. } => {
@@ -401,6 +444,7 @@ impl App {
                             }
                         }
                     }
+                    self.refresh_dashboard_insights();
                 }
             }
         }
@@ -524,27 +568,13 @@ impl App {
         });
     }
 
-    /// Build the auth headers needed for authenticated API requests
-    fn auth_headers(tokens: &AuthTokens) -> Vec<(&'static str, String)> {
-        vec![
-            ("Authorization", format!("Bearer {}", tokens.access_token)),
-            ("Csrf-Token", tokens.csrf_token.clone()),
-            ("A-Sess", tokens.app_session_token.clone()),
-            ("U-Sess", tokens.user_session_token.clone()),
-            (
-                "Dc-Cid",
-                format!("m-ios-{}", uuid::Uuid::new_v4()),
-            ),
-        ]
-    }
-
     /// Fetch vehicle state in the background
     pub fn poll_vehicle_state(&mut self) {
         let Some(tokens) = &self.tokens else {
             return;
         };
         let vehicle_id = tokens.vehicle_id.clone();
-        let headers = Self::auth_headers(tokens);
+        let headers = authenticated_headers(tokens);
         let tx = self.event_tx.clone();
         let debug = self.debug;
         let generation = self.generation;
@@ -607,7 +637,7 @@ impl App {
         let Some(tokens) = &self.tokens else {
             return;
         };
-        let headers = Self::auth_headers(tokens);
+        let headers = authenticated_headers(tokens);
         let tx = self.event_tx.clone();
         let debug = self.debug;
         let generation = self.generation;
@@ -703,6 +733,7 @@ impl App {
                 self.login_error = None;
                 self.login_password.clear();
                 self.login_otp.clear();
+                self.refresh_dashboard_insights();
                 self.log(
                     LogLevel::Info,
                     &format!(
@@ -729,6 +760,8 @@ impl App {
         let _ = AuthManager::clear_tokens();
         self.tokens = None;
         self.vehicle_state = None;
+        self.recent_trend.clear();
+        self.last_charge_session = None;
         self.last_update = None;
         self.mfa_state = None;
         self.pending_vehicle_selection = None;
