@@ -91,10 +91,10 @@ fn tagged_value(tag: &str, value: &str, color: Color) -> (String, Color) {
 }
 
 const R1T_ART: [&str; 4] = [
-    "        _____________        ",
-    " _____ /_|___|___|___\\___    ",
-    "|  _  _   R1T          _ \\   ",
-    "'-(_)-'--------------'-(_)-' ",
+    "        _____________________   ",
+    "  ____/[] [] \\_____        /\\_  ",
+    " /_ R1T        ___\\______/  _ \\ ",
+    "'-(o)---------/___________(o)--'",
 ];
 
 /// Main draw dispatcher
@@ -334,7 +334,7 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
     const VW: usize = 10;
     let show_art = area.width >= 30 && area.height >= 16;
     let sections = if show_art {
-        Layout::vertical([Constraint::Length(5), Constraint::Min(8)]).split(area)
+        Layout::vertical([Constraint::Length(6), Constraint::Min(8)]).split(area)
     } else {
         Layout::vertical([Constraint::Min(8)]).split(area)
     };
