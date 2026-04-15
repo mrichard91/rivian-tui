@@ -1,7 +1,11 @@
 mod api;
 mod app;
+mod config;
 mod db;
+mod mqtt;
 mod tui;
+mod view_model;
+mod web;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -10,18 +14,23 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 
-use api::auth::{AuthManager, authenticated_headers};
-use api::client::{GATEWAY_URL, RivianClient};
+use api::auth::{authenticated_headers, AuthManager};
+use api::client::{RivianClient, CONTENT_URL, GATEWAY_URL, ORDERS_URL, T2D_URL};
 use api::queries;
-use app::{App, Mode};
+use app::{App, LogLevel, Mode};
+use config::AppConfig;
+use mqtt::MqttPublisher;
 
 #[derive(Parser)]
-#[command(name = "rivian-tui", about = "Terminal UI dashboard for Rivian vehicles")]
+#[command(
+    name = "rivian-tui",
+    about = "Terminal UI dashboard for Rivian vehicles"
+)]
 struct Cli {
     /// Enable debug mode (shows full request/response data)
     #[arg(long, short)]
@@ -42,6 +51,10 @@ struct Cli {
     /// GraphQL endpoint for --stdout: gateway (default), charging, orders, content
     #[arg(long, default_value = "gateway")]
     endpoint: String,
+
+    /// Optional path to a config TOML file (defaults to ~/.config/rivian-tui/config.toml)
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -52,13 +65,23 @@ async fn main() -> Result<()> {
         return run_stdout(&cli).await;
     }
 
+    let config = AppConfig::load(cli.config.as_deref())?;
+
+    // Bind the web server (if enabled) before entering the alternate screen so
+    // any bind failure lands on the real terminal, not mid-TUI.
+    let web_listener = if let Some(web_cfg) = config.enabled_web() {
+        Some(web::bind(web_cfg).await?)
+    } else {
+        None
+    };
+
     // Terminal setup
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_tui(&mut terminal, &cli).await;
+    let result = run_tui(&mut terminal, &cli, config, web_listener).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -102,9 +125,9 @@ async fn run_stdout(cli: &Cli) -> Result<()> {
     let url = match cli.endpoint.as_str() {
         "gateway" => GATEWAY_URL,
         "charging" => api::client::CHARGING_URL,
-        "orders" => "https://rivian.com/api/gql/orders/graphql",
-        "content" => "https://rivian.com/api/gql/content/graphql",
-        "t2d" => "https://rivian.com/api/gql/t2d/graphql",
+        "orders" => ORDERS_URL,
+        "content" => CONTENT_URL,
+        "t2d" => T2D_URL,
         other => {
             eprintln!("Unknown endpoint: {other}. Use: gateway, charging, orders, content, t2d");
             std::process::exit(1);
@@ -112,13 +135,7 @@ async fn run_stdout(cli: &Cli) -> Result<()> {
     };
 
     let result: serde_json::Value = client
-        .graphql(
-            url,
-            op_name,
-            query_str,
-            variables,
-            Some(headers),
-        )
+        .graphql(url, op_name, query_str, variables, Some(headers))
         .await?;
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -126,8 +143,42 @@ async fn run_stdout(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, cli: &Cli) -> Result<()> {
-    let mut app = App::new(cli.debug);
+async fn run_tui(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    cli: &Cli,
+    config: AppConfig,
+    web_listener: Option<(tokio::net::TcpListener, std::net::SocketAddr)>,
+) -> Result<()> {
+    let mqtt = config
+        .enabled_mqtt()
+        .cloned()
+        .map(MqttPublisher::start)
+        .transpose()?;
+    let mut app = App::new(cli.debug, mqtt);
+
+    if let Some(mqtt_config) = config.enabled_mqtt() {
+        app.log(
+            LogLevel::Info,
+            &format!("MQTT publishing enabled: {}", mqtt_config.broker_label()),
+        );
+    }
+
+    // Launch the optional web dashboard. The listener was bound in `main()`
+    // before we entered the alternate screen so any error was already
+    // reported.
+    if let Some((listener, addr)) = web_listener {
+        let shared = app.shared_data_handle();
+        app.log(
+            LogLevel::Info,
+            &format!("Web dashboard listening on http://{addr}/"),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = web::serve(listener, shared).await {
+                eprintln!("web server error: {e}");
+            }
+        });
+    }
+
     app.poll_interval_secs = cli.poll_interval;
     app.try_load_auth();
 

@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 
-use super::client::{GATEWAY_URL, RivianClient};
+use super::client::{RivianClient, GATEWAY_URL};
 use super::queries;
 use super::types::*;
 
@@ -96,8 +96,7 @@ impl AuthManager {
         let config_dir = dirs::config_dir()
             .context("could not determine config directory")?
             .join(CONFIG_DIR_NAME);
-        fs::create_dir_all(&config_dir)
-            .context("failed to create config directory")?;
+        fs::create_dir_all(&config_dir).context("failed to create config directory")?;
         Ok(config_dir.join(TOKEN_FILE_NAME))
     }
 
@@ -123,8 +122,7 @@ impl AuthManager {
             KEYRING_ACCOUNT_NAME.to_string(),
         );
 
-        keyring::Entry::new(&service_name, &account_name)
-            .context("failed to create keyring entry")
+        keyring::Entry::new(&service_name, &account_name).context("failed to create keyring entry")
     }
 
     fn load_tokens_from_keyring() -> Result<Option<AuthTokens>> {
@@ -280,9 +278,7 @@ impl AuthManager {
         let result = data.login;
 
         if result.typename == "MobileMFALoginResponse" {
-            let otp_token = result
-                .otp_token
-                .context("MFA response missing otp_token")?;
+            let otp_token = result.otp_token.context("MFA response missing otp_token")?;
 
             let mfa = MfaState {
                 email: email.to_string(),
@@ -301,20 +297,16 @@ impl AuthManager {
             .context("missing user_session_token")?;
 
         self.complete_auth(
-                &access_token,
-                &refresh_token,
-                &user_session_token,
-                &csrf.csrf_token,
-                &csrf.app_session_token,
-            )
-            .await
+            &access_token,
+            &refresh_token,
+            &user_session_token,
+            &csrf.csrf_token,
+            &csrf.app_session_token,
+        )
+        .await
     }
 
-    pub async fn complete_mfa(
-        &self,
-        mfa: &MfaState,
-        otp_code: &str,
-    ) -> Result<LoginOutcome> {
+    pub async fn complete_mfa(&self, mfa: &MfaState, otp_code: &str) -> Result<LoginOutcome> {
         let client_id = format!("m-ios-{}", uuid::Uuid::new_v4());
         let headers = vec![
             ("Csrf-Token", mfa.csrf_token.clone()),

@@ -1,13 +1,33 @@
+use std::sync::{Arc, RwLock};
+
 use chrono::{DateTime, Local, Utc};
+use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::api::auth::{
-    AuthManager, LoginOutcome, PendingVehicleSelection, authenticated_headers,
-};
-use crate::api::client::{API_URL, CHARGING_URL, RequestLog, RivianClient};
+use crate::api::auth::{authenticated_headers, AuthManager, LoginOutcome, PendingVehicleSelection};
+use crate::api::client::{RequestLog, RivianClient, API_URL, CHARGING_URL};
 use crate::api::queries;
 use crate::api::types::*;
 use crate::db::{ChargeSessionSummary, Db, VehicleTrendPoint};
+use crate::mqtt::MqttPublisher;
+
+/// Cap on retained activity log entries. The oldest entries are dropped once
+/// this threshold is exceeded so the log cannot grow without bound during a
+/// long-running session.
+pub const MAX_LOG_ENTRIES: usize = 500;
+
+/// Snapshot of all dashboard-relevant state, shared between the TUI and the
+/// optional web server via an `Arc<RwLock<_>>`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DashboardData {
+    pub vehicle_state: Option<VehicleStateFields>,
+    pub recent_trend: Vec<VehicleTrendPoint>,
+    pub last_charge_session: Option<ChargeSessionSummary>,
+    pub last_update: Option<DateTime<Utc>>,
+    pub vehicle_id: Option<String>,
+}
+
+pub type SharedDashboardData = Arc<RwLock<DashboardData>>;
 
 /// UI mode / active screen
 #[derive(Debug, Clone, PartialEq)]
@@ -128,16 +148,21 @@ pub struct App {
 
     // Database
     pub db: Option<Db>,
+    pub mqtt: Option<MqttPublisher>,
     pub db_snapshot_count: i64,
     pub generation: u64,
 
     // Channel for receiving background events
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
     pub event_rx: mpsc::UnboundedReceiver<AppEvent>,
+
+    // Shared snapshot for out-of-process readers (e.g. the web server). Kept
+    // in sync with the owned fields above whenever dashboard state changes.
+    pub shared_data: SharedDashboardData,
 }
 
 impl App {
-    pub fn new(debug: bool) -> Self {
+    pub fn new(debug: bool, mqtt: Option<MqttPublisher>) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         Self {
             mode: Mode::Dashboard,
@@ -169,12 +194,35 @@ impl App {
             show_log: false,
 
             db: None,
+            mqtt,
             db_snapshot_count: 0,
             generation: 0,
 
             event_tx,
             event_rx,
+            shared_data: Arc::new(RwLock::new(DashboardData::default())),
         }
+    }
+
+    /// Copy the current dashboard-relevant fields into the shared snapshot so
+    /// other readers (web server, etc.) can observe the latest state.
+    fn sync_shared_data(&self) {
+        let snapshot = DashboardData {
+            vehicle_state: self.vehicle_state.clone(),
+            recent_trend: self.recent_trend.clone(),
+            last_charge_session: self.last_charge_session.clone(),
+            last_update: self.last_update,
+            vehicle_id: self.tokens.as_ref().map(|t| t.vehicle_id.clone()),
+        };
+        if let Ok(mut guard) = self.shared_data.write() {
+            *guard = snapshot;
+        }
+    }
+
+    /// Handle to the shared dashboard snapshot. Clone this to pass to
+    /// background tasks (e.g. the web server).
+    pub fn shared_data_handle(&self) -> SharedDashboardData {
+        Arc::clone(&self.shared_data)
     }
 
     /// Build a RivianClient wired to our event channel
@@ -211,6 +259,19 @@ impl App {
         self.log_scroll = self.log_selected.saturating_sub(visible - 1);
     }
 
+    /// Drop oldest log entries so the buffer stays within `MAX_LOG_ENTRIES`.
+    /// Adjusts scroll/selection indices to remain consistent with the new
+    /// length.
+    fn trim_activity_log(&mut self) {
+        if self.activity_log.len() <= MAX_LOG_ENTRIES {
+            return;
+        }
+        let drop = self.activity_log.len() - MAX_LOG_ENTRIES;
+        self.activity_log.drain(..drop);
+        self.log_selected = self.log_selected.saturating_sub(drop);
+        self.log_scroll = self.log_scroll.saturating_sub(drop);
+    }
+
     pub fn log(&mut self, level: LogLevel, msg: &str) {
         self.activity_log.push(LogEntry {
             timestamp: Local::now(),
@@ -218,6 +279,7 @@ impl App {
             message: msg.to_string(),
             detail: None,
         });
+        self.trim_activity_log();
         self.focus_last_log();
     }
 
@@ -228,6 +290,7 @@ impl App {
             message: msg.to_string(),
             detail: Some(detail),
         });
+        self.trim_activity_log();
         self.focus_last_log();
     }
 
@@ -235,11 +298,13 @@ impl App {
         let Some(vehicle_id) = self.tokens.as_ref().map(|tokens| tokens.vehicle_id.clone()) else {
             self.recent_trend.clear();
             self.last_charge_session = None;
+            self.sync_shared_data();
             return;
         };
         let Some(db) = &self.db else {
             self.recent_trend.clear();
             self.last_charge_session = None;
+            self.sync_shared_data();
             return;
         };
 
@@ -263,6 +328,8 @@ impl App {
                 self.log(LogLevel::Error, &format!("Charge summary load failed: {e}"));
             }
         }
+
+        self.sync_shared_data();
     }
 
     /// Initialize database and load auth tokens on startup
@@ -272,7 +339,10 @@ impl App {
                 let count = db.snapshot_count().unwrap_or(0);
                 self.db_snapshot_count = count;
                 self.db = Some(db);
-                self.log(LogLevel::Info, &format!("Database ready ({count} snapshots)"));
+                self.log(
+                    LogLevel::Info,
+                    &format!("Database ready ({count} snapshots)"),
+                );
             }
             Err(e) => {
                 self.log(LogLevel::Error, &format!("Database failed: {e}"));
@@ -291,7 +361,10 @@ impl App {
             }
             Ok(None) => {
                 self.mode = Mode::Login;
-                self.log(LogLevel::Info, "No saved credentials in keychain — please log in");
+                self.log(
+                    LogLevel::Info,
+                    "No saved credentials in keychain — please log in",
+                );
             }
             Err(e) => {
                 self.mode = Mode::Login;
@@ -309,14 +382,14 @@ impl App {
 
             match event {
                 AppEvent::VehicleState { state, .. } => {
-                    // Record to database
+                    let vehicle_id = self
+                        .tokens
+                        .as_ref()
+                        .map(|t| t.vehicle_id.clone())
+                        .unwrap_or_else(|| "unknown".into());
+
                     if let Some(db) = &self.db {
-                        let vid = self
-                            .tokens
-                            .as_ref()
-                            .map(|t| t.vehicle_id.as_str())
-                            .unwrap_or("unknown");
-                        match db.insert_state(vid, &state) {
+                        match db.insert_state(&vehicle_id, &state) {
                             Ok(_) => {
                                 self.db_snapshot_count =
                                     db.snapshot_count().unwrap_or(self.db_snapshot_count);
@@ -326,9 +399,16 @@ impl App {
                             }
                         }
                     }
+
+                    if let Some(mqtt) = &self.mqtt {
+                        if let Err(e) = mqtt.publish_vehicle_state(&vehicle_id, &state) {
+                            self.log(LogLevel::Error, &format!("MQTT publish failed: {e}"));
+                        }
+                    }
+
                     self.vehicle_state = Some(*state);
-                    self.refresh_dashboard_insights();
                     self.last_update = Some(Utc::now());
+                    self.refresh_dashboard_insights();
                     self.log(
                         LogLevel::Info,
                         &format!(
@@ -347,7 +427,10 @@ impl App {
                     self.login_password.clear();
                     self.login_otp.clear();
                     self.refresh_dashboard_insights();
-                    self.log(LogLevel::Info, "Login successful — fetching vehicle state...");
+                    self.log(
+                        LogLevel::Info,
+                        "Login successful — fetching vehicle state...",
+                    );
                 }
                 AppEvent::MfaRequired { mfa, .. } => {
                     self.mfa_state = Some(mfa);
@@ -376,6 +459,7 @@ impl App {
                 }
                 AppEvent::Log { entry, .. } => {
                     self.activity_log.push(entry);
+                    self.trim_activity_log();
                     self.focus_last_log();
                 }
                 AppEvent::RequestLog { req_log, .. } => {
@@ -402,7 +486,8 @@ impl App {
                             // Pretty-print if possible
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
                                 detail.push_str(
-                                    &serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.clone()),
+                                    &serde_json::to_string_pretty(&v)
+                                        .unwrap_or_else(|_| body.clone()),
                                 );
                             } else {
                                 detail.push_str(body);
@@ -413,7 +498,8 @@ impl App {
                             detail.push_str("--- Response Body ---\n");
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(resp) {
                                 detail.push_str(
-                                    &serde_json::to_string_pretty(&v).unwrap_or_else(|_| resp.clone()),
+                                    &serde_json::to_string_pretty(&v)
+                                        .unwrap_or_else(|_| resp.clone()),
                                 );
                             } else {
                                 detail.push_str(resp);
@@ -425,25 +511,51 @@ impl App {
                     }
                 }
                 AppEvent::ChargingSessions { sessions, .. } => {
-                    if let Some(db) = &self.db {
+                    let new_sessions = if let Some(db) = &self.db {
                         match db.upsert_charging_sessions(&sessions) {
-                            Ok(new) => {
+                            Ok(new_sessions) => {
                                 let total = db.charging_session_count().unwrap_or(0);
                                 self.log(
                                     LogLevel::Info,
                                     &format!(
-                                        "Charging history: {new} new sessions ({total} total)"
+                                        "Charging history: {} new sessions ({total} total)",
+                                        new_sessions.len()
                                     ),
                                 );
+                                new_sessions
                             }
                             Err(e) => {
                                 self.log(
                                     LogLevel::Error,
                                     &format!("DB charging write failed: {e}"),
                                 );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        sessions.clone()
+                    };
+
+                    if let Some(mqtt) = &self.mqtt {
+                        let vehicle_id = self
+                            .tokens
+                            .as_ref()
+                            .map(|tokens| tokens.vehicle_id.as_str())
+                            .unwrap_or("unknown");
+                        let publish_sessions = if self.db.is_some() {
+                            &new_sessions
+                        } else {
+                            &sessions
+                        };
+
+                        for session in publish_sessions {
+                            if let Err(e) = mqtt.publish_charging_session(vehicle_id, session) {
+                                self.log(LogLevel::Error, &format!("MQTT publish failed: {e}"));
+                                break;
                             }
                         }
                     }
+
                     self.refresh_dashboard_insights();
                 }
             }
@@ -605,23 +717,20 @@ impl App {
                 .await;
 
             match result {
-                Ok(data) => {
-                    match data.vehicle_state {
-                        Some(state) => {
-                            let _ = tx.send(AppEvent::VehicleState {
-                                generation,
-                                state: Box::new(state),
-                            });
-                        }
-                        None => {
-                            let _ = tx.send(AppEvent::Error {
-                                generation,
-                                msg: "Poll failed: vehicle state was missing from the response"
-                                    .into(),
-                            });
-                        }
+                Ok(data) => match data.vehicle_state {
+                    Some(state) => {
+                        let _ = tx.send(AppEvent::VehicleState {
+                            generation,
+                            state: Box::new(state),
+                        });
                     }
-                }
+                    None => {
+                        let _ = tx.send(AppEvent::Error {
+                            generation,
+                            msg: "Poll failed: vehicle state was missing from the response".into(),
+                        });
+                    }
+                },
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error {
                         generation,
@@ -716,11 +825,7 @@ impl App {
         let Some(pending) = self.pending_vehicle_selection.clone() else {
             return;
         };
-        let Some(vehicle) = pending
-            .vehicles
-            .get(self.vehicle_selection_index)
-            .cloned()
-        else {
+        let Some(vehicle) = pending.vehicles.get(self.vehicle_selection_index).cloned() else {
             return;
         };
 
@@ -736,10 +841,7 @@ impl App {
                 self.refresh_dashboard_insights();
                 self.log(
                     LogLevel::Info,
-                    &format!(
-                        "Selected vehicle {}",
-                        vehicle.name.unwrap_or(vehicle.id)
-                    ),
+                    &format!("Selected vehicle {}", vehicle.name.unwrap_or(vehicle.id)),
                 );
                 self.poll_vehicle_state();
                 self.fetch_charging_history();
@@ -773,6 +875,7 @@ impl App {
         self.vehicle_selection_index = 0;
         self.show_debug_detail = false;
         self.mode = Mode::Login;
+        self.sync_shared_data();
         self.log(LogLevel::Info, "Logged out");
     }
 
@@ -841,7 +944,7 @@ mod tests {
     #[test]
     fn ignores_stale_vehicle_state_events_after_logout() {
         let _auth = AuthTestContext::new();
-        let mut app = App::new(false);
+        let mut app = App::new(false, None);
         app.tokens = Some(sample_tokens());
         let generation = app.generation;
 
@@ -859,7 +962,7 @@ mod tests {
 
     #[test]
     fn log_selection_moves_independently_from_scroll() {
-        let mut app = App::new(true);
+        let mut app = App::new(true, None);
         for idx in 0..12 {
             app.log(LogLevel::Info, &format!("log {idx}"));
         }

@@ -3,7 +3,8 @@
 //! Query format verified against rivian-python-client and rivian-python-api.
 //! Variable naming: $vehicleID (capital D), type String!, argument `id:`.
 
-pub const CREATE_CSRF_TOKEN: &str = "mutation CreateCSRFToken { createCsrfToken { __typename csrfToken appSessionToken } }";
+pub const CREATE_CSRF_TOKEN: &str =
+    "mutation CreateCSRFToken { createCsrfToken { __typename csrfToken appSessionToken } }";
 
 pub const LOGIN: &str = "mutation Login($email: String!, $password: String!) { login(email: $email, password: $password) { __typename ... on MobileLoginResponse { accessToken refreshToken userSessionToken } ... on MobileMFALoginResponse { otpToken } } }";
 

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::types::GraphQlResponse;
@@ -13,6 +13,9 @@ pub const GATEWAY_URL: &str = "https://rivian.com/api/gql/gateway/graphql";
 /// Vehicle state and other authenticated queries go through the same gateway
 pub const API_URL: &str = "https://rivian.com/api/gql/gateway/graphql";
 pub const CHARGING_URL: &str = "https://rivian.com/api/gql/chrg/user/graphql";
+pub const ORDERS_URL: &str = "https://rivian.com/api/gql/orders/graphql";
+pub const CONTENT_URL: &str = "https://rivian.com/api/gql/content/graphql";
+pub const T2D_URL: &str = "https://rivian.com/api/gql/t2d/graphql";
 
 /// A log entry emitted by the client for each request
 #[derive(Debug, Clone)]
@@ -69,19 +72,11 @@ impl RivianClient {
         let mut headers = HeaderMap::new();
         headers.insert(
             "User-Agent",
-            HeaderValue::from_static(
-                "RivianApp/1304 CFNetwork/1404.0.5 Darwin/22.3.0",
-            ),
+            HeaderValue::from_static("RivianApp/1304 CFNetwork/1404.0.5 Darwin/22.3.0"),
         );
         headers.insert("Accept", HeaderValue::from_static("application/json"));
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_static("application/json"),
-        );
-        headers.insert(
-            "Accept-Language",
-            HeaderValue::from_static("en-US"),
-        );
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+        headers.insert("Accept-Language", HeaderValue::from_static("en-US"));
         headers.insert(
             "Apollographql-Client-Name",
             HeaderValue::from_static("com.rivian.ios.consumer-apollo-ios"),

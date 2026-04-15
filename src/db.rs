@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::api::types::{ChargingSession, VehicleStateFields};
 
@@ -12,7 +13,7 @@ pub struct Db {
     conn: Connection,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VehicleTrendPoint {
     pub battery_level: Option<f64>,
     pub range_km: Option<f64>,
@@ -20,7 +21,7 @@ pub struct VehicleTrendPoint {
     pub speed_kmh: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChargeSessionSummary {
     pub start_instant: Option<String>,
     pub end_instant: Option<String>,
@@ -210,18 +211,40 @@ impl Db {
         // Add columns that may not exist in older DBs
         let add_cols = [
             "distance_to_empty_km REAL",
-            "charge_port_state TEXT", "charger_derate TEXT", "remote_charging_available REAL",
-            "battery_hv_thermal TEXT", "driver_temp_c REAL", "preconditioning_type TEXT",
-            "seat_heat_rl TEXT", "seat_heat_rr TEXT", "seat_vent_fl TEXT", "seat_vent_fr TEXT",
-            "speed REAL", "altitude REAL", "bearing REAL",
-            "ota_current_status TEXT", "ota_download_progress REAL",
-            "ota_install_progress REAL", "ota_install_ready TEXT",
-            "door_fl_locked TEXT", "door_fr_locked TEXT", "door_rl_locked TEXT", "door_rr_locked TEXT",
-            "frunk_locked TEXT", "liftgate_locked TEXT", "tailgate_locked TEXT",
-            "side_bin_l TEXT", "side_bin_r TEXT",
-            "pet_mode_temp TEXT", "gear_guard_video TEXT", "gear_guard_video_mode TEXT",
-            "alarm_status TEXT", "wiper_fluid TEXT",
-            "service_mode TEXT", "trailer_status TEXT", "car_wash_mode TEXT",
+            "charge_port_state TEXT",
+            "charger_derate TEXT",
+            "remote_charging_available REAL",
+            "battery_hv_thermal TEXT",
+            "driver_temp_c REAL",
+            "preconditioning_type TEXT",
+            "seat_heat_rl TEXT",
+            "seat_heat_rr TEXT",
+            "seat_vent_fl TEXT",
+            "seat_vent_fr TEXT",
+            "speed REAL",
+            "altitude REAL",
+            "bearing REAL",
+            "ota_current_status TEXT",
+            "ota_download_progress REAL",
+            "ota_install_progress REAL",
+            "ota_install_ready TEXT",
+            "door_fl_locked TEXT",
+            "door_fr_locked TEXT",
+            "door_rl_locked TEXT",
+            "door_rr_locked TEXT",
+            "frunk_locked TEXT",
+            "liftgate_locked TEXT",
+            "tailgate_locked TEXT",
+            "side_bin_l TEXT",
+            "side_bin_r TEXT",
+            "pet_mode_temp TEXT",
+            "gear_guard_video TEXT",
+            "gear_guard_video_mode TEXT",
+            "alarm_status TEXT",
+            "wiper_fluid TEXT",
+            "service_mode TEXT",
+            "trailer_status TEXT",
+            "car_wash_mode TEXT",
         ];
         for col in &add_cols {
             let sql = format!("ALTER TABLE vehicle_state ADD COLUMN {col}");
@@ -379,9 +402,12 @@ impl Db {
         Ok(count)
     }
 
-    /// Upsert charging sessions (dedup by transaction_id). Returns count of new rows.
-    pub fn upsert_charging_sessions(&self, sessions: &[ChargingSession]) -> Result<usize> {
-        let mut new_count = 0;
+    /// Upsert charging sessions (dedup by transaction_id). Returns the new rows.
+    pub fn upsert_charging_sessions(
+        &self,
+        sessions: &[ChargingSession],
+    ) -> Result<Vec<ChargingSession>> {
+        let mut new_sessions = Vec::new();
         for s in sessions {
             let dedupe_key = charging_session_dedupe_key(s);
             let result = self.conn.execute(
@@ -399,17 +425,17 @@ impl Db {
                 ],
             )?;
             if result > 0 {
-                new_count += 1;
+                new_sessions.push(s.clone());
             }
         }
-        Ok(new_count)
+        Ok(new_sessions)
     }
 
     /// Get total charging session count
     pub fn charging_session_count(&self) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM charging_sessions", [], |r| r.get(0),
-        )?;
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM charging_sessions", [], |r| r.get(0))?;
         Ok(count)
     }
 
@@ -565,7 +591,7 @@ mod tests {
             .upsert_charging_sessions(&[session.clone(), session])
             .unwrap();
 
-        assert_eq!(inserted, 1);
+        assert_eq!(inserted.len(), 1);
         assert_eq!(db.charging_session_count().unwrap(), 1);
     }
 
@@ -573,7 +599,11 @@ mod tests {
     fn recent_vehicle_trend_returns_oldest_to_newest() {
         let db = make_test_db();
 
-        for (battery, range, mileage) in [(75.0, 320.0, 1000.0), (74.0, 315.0, 1010.0), (73.5, 312.0, 1020.0)] {
+        for (battery, range, mileage) in [
+            (75.0, 320.0, 1000.0),
+            (74.0, 315.0, 1010.0),
+            (73.5, 312.0, 1020.0),
+        ] {
             let json = format!(
                 r#"{{
                     "batteryLevel": {{ "value": {battery} }},

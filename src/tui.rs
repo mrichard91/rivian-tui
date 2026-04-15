@@ -20,12 +20,7 @@ fn kvw(w: usize, label: &str, val: &str) -> Line<'static> {
 }
 
 /// Render a pair of status values (e.g., door left/right)
-fn kv_pair(
-    w: usize,
-    label: &str,
-    l: &(String, Color),
-    r: &(String, Color),
-) -> Line<'static> {
+fn kv_pair(w: usize, label: &str, l: &(String, Color), r: &(String, Color)) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {label:.<w$} ", w = w),
@@ -117,7 +112,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
 
     let mut constraints = vec![
         Constraint::Length(3), // header
-        Constraint::Min(8),   // body
+        Constraint::Min(8),    // body
     ];
     if app.show_log {
         constraints.push(Constraint::Length(if app.debug { 16 } else { 10 }));
@@ -150,11 +145,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let connected = app.tokens.is_some();
     let status_icon = if connected { "●" } else { "○" };
-    let status_color = if connected {
-        Color::Green
-    } else {
-        Color::Red
-    };
+    let status_color = if connected { Color::Green } else { Color::Red };
 
     let vehicle_id = app
         .tokens
@@ -212,14 +203,12 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "Not connected"
         };
-        let waiting = Paragraph::new(msg)
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .title(" Dashboard "),
-            );
+        let waiting = Paragraph::new(msg).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Dashboard "),
+        );
         frame.render_widget(waiting, area);
         return;
     };
@@ -251,11 +240,8 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     draw_col_vehicle(frame, cols[1], vs);
     draw_col_status(frame, cols[2], vs);
 
-    let insights = Layout::horizontal([
-        Constraint::Percentage(60),
-        Constraint::Percentage(40),
-    ])
-    .split(sections[section_idx + 1]);
+    let insights = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(sections[section_idx + 1]);
 
     draw_trend_panel(frame, insights[0], app, vs);
     draw_charge_insights(frame, insights[1], app, vs);
@@ -263,11 +249,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Left column: battery gauge + charging
 fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::VehicleStateFields) {
-    let rows = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Min(6),
-    ])
-    .split(area);
+    let rows = Layout::vertical([Constraint::Length(5), Constraint::Min(6)]).split(area);
 
     // Battery gauge
     let pct = vs.battery_percent().unwrap_or(0.0);
@@ -301,7 +283,11 @@ fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
         .battery_capacity_kwh()
         .map(|c| format!("{c:.1} kWh"))
         .unwrap_or_else(|| "—".into());
-    let remote = bool_badge(vs.get_boolish(&vs.remote_charging_available), "ready", "off");
+    let remote = bool_badge(
+        vs.get_boolish(&vs.remote_charging_available),
+        "ready",
+        "off",
+    );
     let thermal = vs.get_str(&vs.battery_hv_thermal_event);
     let thermal_color = status_color(thermal);
     let derate = vs.get_str(&vs.charger_derate_status);
@@ -314,7 +300,12 @@ fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
     let lines = vec![
         kvw(CW, "State", vs.charger_state_str()),
         kvw(CW, "Charger", vs.charger_status_str()),
-        kv(CW, "Port", vs.get_str(&vs.charge_port_state), status_color(vs.get_str(&vs.charge_port_state))),
+        kv(
+            CW,
+            "Port",
+            vs.get_str(&vs.charge_port_state),
+            status_color(vs.get_str(&vs.charge_port_state)),
+        ),
         kv(CW, "Remote", &remote.0, remote.1),
         kv(CW, "Thermal", thermal, thermal_color),
         kv(CW, "Derate", derate, derate_color),
@@ -346,7 +337,10 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
     } else {
         Color::Gray
     };
-    let mileage = vs.mileage().map(|m| format!("{m:.0} mi")).unwrap_or_else(|| "—".into());
+    let mileage = vs
+        .mileage()
+        .map(|m| format!("{m:.0} mi"))
+        .unwrap_or_else(|| "—".into());
     let cabin = vs
         .cabin_temp_f()
         .map(|t| format!("{t:.1} F"))
@@ -378,7 +372,11 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
     } else {
         "None".into()
     };
-    let cold_color = if cold_active { Color::Yellow } else { Color::Green };
+    let cold_color = if cold_active {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
     let climate_summary = if precon_type != "unknown" {
         format!("{precon} / {precon_type}")
     } else {
@@ -407,20 +405,20 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
             .map(|line| {
                 Line::from(Span::styled(
                     *line,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ))
             })
             .collect();
 
         frame.render_widget(
-            Paragraph::new(art)
-                .alignment(Alignment::Center)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan))
-                        .title(" R1T "),
-                ),
+            Paragraph::new(art).alignment(Alignment::Center).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(" R1T "),
+            ),
             sections[0],
         );
     }
@@ -445,10 +443,9 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     const RW: usize = 8;
 
     // --- Access ---
-    let access_icon = |
-        closed: &Option<crate::api::types::StateValue>,
-        locked: &Option<crate::api::types::StateValue>,
-    | -> (String, Color) {
+    let access_icon = |closed: &Option<crate::api::types::StateValue>,
+                       locked: &Option<crate::api::types::StateValue>|
+     -> (String, Color) {
         match (
             closed.as_ref().and_then(|v| v.as_str()),
             locked.as_ref().and_then(|v| v.as_str()),
@@ -533,9 +530,7 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     let available = vs.get_str(&vs.ota_available_version);
     let ota_status = vs.get_str(&vs.ota_status);
     let install_ready = vs.get_str(&vs.ota_install_ready);
-    let progress = vs
-        .ota_progress_summary()
-        .unwrap_or_else(|| "—".into());
+    let progress = vs.ota_progress_summary().unwrap_or_else(|| "—".into());
     let location = vs.location_summary().unwrap_or_else(|| "—".into());
     let heading = vs.heading_summary().unwrap_or_else(|| "—".into());
     let last_sync = vs.last_sync().unwrap_or("—");
@@ -548,7 +543,11 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     let mode_right = tagged_value("Wash", wash, status_color(wash));
 
     let has_update = available != "0.0.0" && available != "unknown" && available != current;
-    let avail_color = if has_update { Color::Yellow } else { Color::DarkGray };
+    let avail_color = if has_update {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
     let avail_str = if has_update { available } else { "up to date" };
 
     let system_lines = vec![
@@ -572,8 +571,16 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
         Paragraph::new(system_lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if has_update { Color::Yellow } else { Color::Cyan }))
-                .title(if has_update { " System / OTA " } else { " System " }),
+                .border_style(Style::default().fg(if has_update {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                }))
+                .title(if has_update {
+                    " System / OTA "
+                } else {
+                    " System "
+                }),
         ),
         rows[1],
     );
@@ -590,7 +597,10 @@ fn collect_alerts(vs: &crate::api::types::VehicleStateFields) -> Vec<(String, Co
         &vs.closure_frunk_closed,
         &vs.closure_liftgate_closed,
     ];
-    if door_fields.iter().any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open"))) {
+    if door_fields
+        .iter()
+        .any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open")))
+    {
         alerts.push(("Door or hatch open".into(), Color::Red));
     }
 
@@ -600,7 +610,10 @@ fn collect_alerts(vs: &crate::api::types::VehicleStateFields) -> Vec<(String, Co
         &vs.window_rear_left_closed,
         &vs.window_rear_right_closed,
     ];
-    if window_fields.iter().any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open"))) {
+    if window_fields
+        .iter()
+        .any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open")))
+    {
         alerts.push(("Window open".into(), Color::Red));
     }
 
@@ -755,7 +768,10 @@ fn draw_trend_panel(
         rows[0],
     );
 
-    let battery_data = sparkline_data(app.recent_trend.iter().map(|point| point.battery_level), 10.0);
+    let battery_data = sparkline_data(
+        app.recent_trend.iter().map(|point| point.battery_level),
+        10.0,
+    );
     let range_data = sparkline_data(app.recent_trend.iter().map(|point| point.range_km), 1.0);
 
     frame.render_widget(
@@ -804,7 +820,11 @@ fn format_charge_time(session: &crate::db::ChargeSessionSummary) -> String {
         .as_deref()
         .or(session.start_instant.as_deref())
         .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%b %d %H:%M").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%b %d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|| "—".into())
 }
 
@@ -816,13 +836,22 @@ fn draw_charge_insights(
 ) {
     const W: usize = 9;
     let active = vs.is_actively_charging();
-    let title = if active { " Charge Live " } else { " Charge Summary " };
+    let title = if active {
+        " Charge Live "
+    } else {
+        " Charge Summary "
+    };
     let border = if active { Color::Green } else { Color::Cyan };
 
     let rows = if active {
         let (battery_delta, range_delta, _, _) = trend_delta(app);
         vec![
-            kv(W, "State", vs.charger_state_str(), status_color(vs.charger_state_str())),
+            kv(
+                W,
+                "State",
+                vs.charger_state_str(),
+                status_color(vs.charger_state_str()),
+            ),
             kvw(W, "Status", vs.charger_status_str()),
             kvw(
                 W,
@@ -833,11 +862,7 @@ fn draw_charge_insights(
                     vs.range_miles().unwrap_or_default()
                 ),
             ),
-            kvw(
-                W,
-                "Time",
-                &vs.time_to_full().unwrap_or_else(|| "—".into()),
-            ),
+            kvw(W, "Time", &vs.time_to_full().unwrap_or_else(|| "—".into())),
             kvw(
                 W,
                 "Trend",
@@ -855,11 +880,7 @@ fn draw_charge_insights(
         ]
     } else if let Some(session) = &app.last_charge_session {
         vec![
-            kvw(
-                W,
-                "When",
-                &format_charge_time(session),
-            ),
+            kvw(W, "When", &format_charge_time(session)),
             kvw(
                 W,
                 "Energy",
@@ -879,10 +900,7 @@ fn draw_charge_insights(
             kvw(
                 W,
                 "Site",
-                &session
-                    .vendor
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into()),
+                &session.vendor.clone().unwrap_or_else(|| "unknown".into()),
             ),
             kvw(
                 W,
@@ -929,8 +947,8 @@ fn draw_activity_log(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.activity_log.is_empty() {
-        let empty = Paragraph::new("  No activity yet...")
-            .style(Style::default().fg(Color::DarkGray));
+        let empty =
+            Paragraph::new("  No activity yet...").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty, inner);
         return;
     }
@@ -954,14 +972,8 @@ fn draw_activity_log(frame: &mut Frame, area: Rect, app: &App) {
             let has_detail = entry.detail.is_some();
 
             let mut spans = vec![
-                Span::styled(
-                    format!(" {ts} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{level_str} "),
-                    Style::default().fg(level_color),
-                ),
+                Span::styled(format!(" {ts} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{level_str} "), Style::default().fg(level_color)),
                 Span::styled(
                     &entry.message,
                     if is_selected {
@@ -973,10 +985,7 @@ fn draw_activity_log(frame: &mut Frame, area: Rect, app: &App) {
             ];
 
             if has_detail && app.debug {
-                spans.push(Span::styled(
-                    " [+]",
-                    Style::default().fg(Color::Yellow),
-                ));
+                spans.push(Span::styled(" [+]", Style::default().fg(Color::Yellow)));
             }
 
             Line::from(spans)
@@ -1022,14 +1031,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         " q:Quit  r:Refresh  l:Log  L:Logout "
     };
 
-    let footer = Line::from(vec![
-        Span::styled(
-            keybinds,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        ),
-    ]);
+    let footer = Line::from(vec![Span::styled(
+        keybinds,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )]);
 
     frame.render_widget(Paragraph::new(footer), area);
 }
@@ -1073,16 +1080,14 @@ fn draw_login(frame: &mut Frame, app: &App) {
 
     // Email
     let email_style = field_style(app.login_field == LoginField::Email);
-    let email_label =
-        Paragraph::new("  Email:").style(Style::default().fg(Color::DarkGray));
+    let email_label = Paragraph::new("  Email:").style(Style::default().fg(Color::DarkGray));
     let email_input = Paragraph::new(format!("  {}", app.login_email)).style(email_style);
     frame.render_widget(email_label, rows[2]);
     frame.render_widget(email_input, rows[3]);
 
     // Password
     let pw_style = field_style(app.login_field == LoginField::Password);
-    let pw_label =
-        Paragraph::new("  Password:").style(Style::default().fg(Color::DarkGray));
+    let pw_label = Paragraph::new("  Password:").style(Style::default().fg(Color::DarkGray));
     let masked: String = "*".repeat(app.login_password.len());
     let pw_input = Paragraph::new(format!("  {masked}")).style(pw_style);
     frame.render_widget(pw_label, rows[5]);
@@ -1092,10 +1097,7 @@ fn draw_login(frame: &mut Frame, app: &App) {
     let msg = if app.login_busy {
         Span::styled("  Logging in...", Style::default().fg(Color::Yellow))
     } else if let Some(err) = &app.login_error {
-        Span::styled(
-            format!("  {err}"),
-            Style::default().fg(Color::Red),
-        )
+        Span::styled(format!("  {err}"), Style::default().fg(Color::Red))
     } else {
         Span::styled(
             "  Tab:switch field  Enter:submit  Esc:quit",
@@ -1139,10 +1141,8 @@ fn draw_mfa(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::White));
     frame.render_widget(title, rows[0]);
 
-    let otp_label =
-        Paragraph::new("  OTP Code:").style(Style::default().fg(Color::DarkGray));
-    let otp_input = Paragraph::new(format!("  {}", app.login_otp))
-        .style(field_style(true));
+    let otp_label = Paragraph::new("  OTP Code:").style(Style::default().fg(Color::DarkGray));
+    let otp_input = Paragraph::new(format!("  {}", app.login_otp)).style(field_style(true));
     frame.render_widget(otp_label, rows[2]);
     frame.render_widget(otp_input, rows[3]);
 
@@ -1236,9 +1236,7 @@ fn draw_vehicle_select(frame: &mut Frame, app: &App) {
 
 fn field_style(focused: bool) -> Style {
     if focused {
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
+        Style::default().fg(Color::White).bg(Color::DarkGray)
     } else {
         Style::default().fg(Color::Gray)
     }

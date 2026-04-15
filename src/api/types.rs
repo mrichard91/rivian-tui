@@ -130,7 +130,7 @@ pub struct ChargingSessionsData {
     pub get_completed_session_summaries: Vec<ChargingSession>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChargingSession {
     pub charger_type: Option<String>,
@@ -159,7 +159,7 @@ pub struct VehicleStateData {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VehicleStateFields {
     // Power & drive
@@ -267,7 +267,7 @@ pub struct VehicleStateFields {
 }
 
 /// Flexible value type — Rivian API returns mixed types (strings, numbers, bools)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateValue {
     pub value: serde_json::Value,
 }
@@ -300,7 +300,7 @@ impl StateValue {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GnssLocation {
     pub latitude: Option<f64>,
@@ -308,10 +308,15 @@ pub struct GnssLocation {
     pub time_stamp: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudConnection {
     pub last_sync: Option<String>,
+}
+
+/// Convert a Celsius temperature to Fahrenheit.
+pub fn celsius_to_fahrenheit(c: f64) -> f64 {
+    c * 9.0 / 5.0 + 32.0
 }
 
 impl VehicleStateFields {
@@ -320,10 +325,7 @@ impl VehicleStateFields {
     }
 
     pub fn get_str<'a>(&'a self, field: &'a Option<StateValue>) -> &'a str {
-        field
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
+        field.as_ref().and_then(|v| v.as_str()).unwrap_or("unknown")
     }
 
     pub fn get_boolish(&self, field: &Option<StateValue>) -> Option<bool> {
@@ -347,24 +349,22 @@ impl VehicleStateFields {
 
     /// distanceToEmpty is in km from the API
     pub fn range_miles(&self) -> Option<f64> {
-        self.get_f64(&self.distance_to_empty)
-            .map(|km| km / 1.60934)
+        self.get_f64(&self.distance_to_empty).map(|km| km / 1.60934)
     }
 
     /// vehicleMileage is in meters from the API
     pub fn mileage(&self) -> Option<f64> {
-        self.get_f64(&self.vehicle_mileage)
-            .map(|m| m / 1609.344)
+        self.get_f64(&self.vehicle_mileage).map(|m| m / 1609.344)
     }
 
     pub fn cabin_temp_f(&self) -> Option<f64> {
         self.get_f64(&self.cabin_climate_interior_temperature)
-            .map(|c| c * 9.0 / 5.0 + 32.0)
+            .map(celsius_to_fahrenheit)
     }
 
     pub fn driver_temp_f(&self) -> Option<f64> {
         self.get_f64(&self.cabin_climate_driver_temperature)
-            .map(|c| c * 9.0 / 5.0 + 32.0)
+            .map(celsius_to_fahrenheit)
     }
 
     pub fn speed_mph(&self) -> Option<f64> {
@@ -372,7 +372,8 @@ impl VehicleStateFields {
     }
 
     pub fn altitude_ft(&self) -> Option<f64> {
-        self.get_f64(&self.gnss_altitude).map(|meters| meters * 3.28084)
+        self.get_f64(&self.gnss_altitude)
+            .map(|meters| meters * 3.28084)
     }
 
     pub fn power_state_str(&self) -> &str {
@@ -445,8 +446,12 @@ impl VehicleStateFields {
     }
 
     pub fn ota_progress_summary(&self) -> Option<String> {
-        let install = self.get_f64(&self.ota_install_progress).filter(|v| *v > 0.0);
-        let download = self.get_f64(&self.ota_download_progress).filter(|v| *v > 0.0);
+        let install = self
+            .get_f64(&self.ota_install_progress)
+            .filter(|v| *v > 0.0);
+        let download = self
+            .get_f64(&self.ota_download_progress)
+            .filter(|v| *v > 0.0);
 
         if let Some(progress) = install {
             return Some(format!("install {progress:.0}%"));
@@ -617,8 +622,7 @@ mod tests {
             }
         }"#;
 
-        let resp: GraphQlResponse<VehicleStateData> =
-            serde_json::from_str(json).unwrap();
+        let resp: GraphQlResponse<VehicleStateData> = serde_json::from_str(json).unwrap();
         let vs = resp.data.unwrap().vehicle_state.unwrap();
 
         assert!((vs.battery_percent().unwrap() - 72.0).abs() < f64::EPSILON);
@@ -661,8 +665,7 @@ mod tests {
             }
         }"#;
 
-        let resp: GraphQlResponse<VehicleStateData> =
-            serde_json::from_str(json).unwrap();
+        let resp: GraphQlResponse<VehicleStateData> = serde_json::from_str(json).unwrap();
         let vs = resp.data.unwrap().vehicle_state.unwrap();
 
         assert!((vs.battery_percent().unwrap() - 55.0).abs() < f64::EPSILON);
@@ -687,8 +690,7 @@ mod tests {
             }
         }"#;
 
-        let resp: GraphQlResponse<VehicleStateData> =
-            serde_json::from_str(json).unwrap();
+        let resp: GraphQlResponse<VehicleStateData> = serde_json::from_str(json).unwrap();
         let vs = resp.data.unwrap().vehicle_state.unwrap();
 
         assert!((vs.battery_percent().unwrap() - 72.0).abs() < 0.01);
@@ -708,8 +710,7 @@ mod tests {
             ]
         }"#;
 
-        let resp: GraphQlResponse<VehicleStateData> =
-            serde_json::from_str(json).unwrap();
+        let resp: GraphQlResponse<VehicleStateData> = serde_json::from_str(json).unwrap();
         assert!(resp.data.is_none());
         let errors = resp.errors.unwrap();
         assert_eq!(errors.len(), 2);
