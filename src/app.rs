@@ -8,7 +8,7 @@ use crate::api::auth::{authenticated_headers, AuthManager, LoginOutcome, Pending
 use crate::api::client::{RequestLog, RivianClient, API_URL, CHARGING_URL};
 use crate::api::queries;
 use crate::api::types::*;
-use crate::db::{ChargeSessionSummary, Db, VehicleTrendPoint};
+use crate::db::{ChargeSessionSummary, ChargingStats, Db, VehicleTrendPoint};
 use crate::mqtt::MqttPublisher;
 
 /// Cap on retained activity log entries. The oldest entries are dropped once
@@ -23,6 +23,8 @@ pub struct DashboardData {
     pub vehicle_state: Option<VehicleStateFields>,
     pub recent_trend: Vec<VehicleTrendPoint>,
     pub last_charge_session: Option<ChargeSessionSummary>,
+    pub live_charging_session: Option<LiveChargingSession>,
+    pub charging_stats: Option<ChargingStats>,
     pub last_update: Option<DateTime<Utc>>,
     pub vehicle_id: Option<String>,
 }
@@ -96,6 +98,10 @@ pub enum AppEvent {
         generation: u64,
         sessions: Vec<ChargingSession>,
     },
+    LiveChargingSession {
+        generation: u64,
+        session: Option<Box<LiveChargingSession>>,
+    },
 }
 
 impl AppEvent {
@@ -108,7 +114,8 @@ impl AppEvent {
             | Self::Error { generation, .. }
             | Self::Log { generation, .. }
             | Self::RequestLog { generation, .. }
-            | Self::ChargingSessions { generation, .. } => *generation,
+            | Self::ChargingSessions { generation, .. }
+            | Self::LiveChargingSession { generation, .. } => *generation,
         }
     }
 }
@@ -136,6 +143,8 @@ pub struct App {
     pub vehicle_state: Option<VehicleStateFields>,
     pub recent_trend: Vec<VehicleTrendPoint>,
     pub last_charge_session: Option<ChargeSessionSummary>,
+    pub live_charging_session: Option<LiveChargingSession>,
+    pub charging_stats: Option<ChargingStats>,
     pub last_update: Option<DateTime<Utc>>,
     pub poll_interval_secs: u64,
 
@@ -184,6 +193,8 @@ impl App {
             vehicle_state: None,
             recent_trend: Vec::new(),
             last_charge_session: None,
+            live_charging_session: None,
+            charging_stats: None,
             last_update: None,
             poll_interval_secs: 300,
 
@@ -211,6 +222,8 @@ impl App {
             vehicle_state: self.vehicle_state.clone(),
             recent_trend: self.recent_trend.clone(),
             last_charge_session: self.last_charge_session.clone(),
+            live_charging_session: self.live_charging_session.clone(),
+            charging_stats: self.charging_stats.clone(),
             last_update: self.last_update,
             vehicle_id: self.tokens.as_ref().map(|t| t.vehicle_id.clone()),
         };
@@ -259,6 +272,17 @@ impl App {
         self.log_scroll = self.log_selected.saturating_sub(visible - 1);
     }
 
+    /// True when the user is currently focused on the latest log entry — i.e.
+    /// the log is "tailing". When that's the case, new entries should keep the
+    /// view pinned to the bottom; when it's not, a fresh entry should not
+    /// yank focus away from whatever the user is reading.
+    fn log_is_tailing(&self) -> bool {
+        match self.activity_log.len() {
+            0 => true,
+            n => self.log_selected + 1 >= n,
+        }
+    }
+
     /// Drop oldest log entries so the buffer stays within `MAX_LOG_ENTRIES`.
     /// Adjusts scroll/selection indices to remain consistent with the new
     /// length.
@@ -273,6 +297,7 @@ impl App {
     }
 
     pub fn log(&mut self, level: LogLevel, msg: &str) {
+        let was_tailing = self.log_is_tailing();
         self.activity_log.push(LogEntry {
             timestamp: Local::now(),
             level,
@@ -280,10 +305,13 @@ impl App {
             detail: None,
         });
         self.trim_activity_log();
-        self.focus_last_log();
+        if was_tailing {
+            self.focus_last_log();
+        }
     }
 
     fn log_with_detail(&mut self, level: LogLevel, msg: &str, detail: String) {
+        let was_tailing = self.log_is_tailing();
         self.activity_log.push(LogEntry {
             timestamp: Local::now(),
             level,
@@ -291,25 +319,30 @@ impl App {
             detail: Some(detail),
         });
         self.trim_activity_log();
-        self.focus_last_log();
+        if was_tailing {
+            self.focus_last_log();
+        }
     }
 
     fn refresh_dashboard_insights(&mut self) {
         let Some(vehicle_id) = self.tokens.as_ref().map(|tokens| tokens.vehicle_id.clone()) else {
             self.recent_trend.clear();
             self.last_charge_session = None;
+            self.charging_stats = None;
             self.sync_shared_data();
             return;
         };
         let Some(db) = &self.db else {
             self.recent_trend.clear();
             self.last_charge_session = None;
+            self.charging_stats = None;
             self.sync_shared_data();
             return;
         };
 
-        let trend_result = db.recent_vehicle_trend(&vehicle_id, 24);
+        let trend_result = db.recent_vehicle_trend(&vehicle_id, 24); // last 24 hours
         let charge_result = db.latest_charging_session(&vehicle_id);
+        let stats_result = db.charging_session_stats(&vehicle_id);
 
         match trend_result {
             Ok(points) => {
@@ -326,6 +359,15 @@ impl App {
             }
             Err(e) => {
                 self.log(LogLevel::Error, &format!("Charge summary load failed: {e}"));
+            }
+        }
+
+        match stats_result {
+            Ok(stats) => {
+                self.charging_stats = stats;
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, &format!("Charging stats load failed: {e}"));
             }
         }
 
@@ -406,16 +448,29 @@ impl App {
                         }
                     }
 
+                    let charging_now = state.is_actively_charging();
                     self.vehicle_state = Some(*state);
                     self.last_update = Some(Utc::now());
                     self.refresh_dashboard_insights();
                     self.log(
                         LogLevel::Info,
                         &format!(
-                            "Vehicle state updated ({}  snapshots recorded)",
+                            "Vehicle state updated ({} snapshots recorded)",
                             self.db_snapshot_count
                         ),
                     );
+
+                    if charging_now {
+                        // Fire a live-session fetch alongside the regular poll
+                        // so the dashboard sees current power / kWh delivered.
+                        self.fetch_live_session();
+                    } else if self.live_charging_session.take().is_some() {
+                        // Session ended — drop the stale live snapshot and
+                        // refresh the historical view so a brand-new
+                        // completed session shows up immediately.
+                        self.fetch_charging_history();
+                        self.sync_shared_data();
+                    }
                 }
                 AppEvent::AuthSuccess { tokens, .. } => {
                     self.tokens = Some(tokens);
@@ -458,9 +513,12 @@ impl App {
                     self.log(LogLevel::Error, &msg);
                 }
                 AppEvent::Log { entry, .. } => {
+                    let was_tailing = self.log_is_tailing();
                     self.activity_log.push(entry);
                     self.trim_activity_log();
-                    self.focus_last_log();
+                    if was_tailing {
+                        self.focus_last_log();
+                    }
                 }
                 AppEvent::RequestLog { req_log, .. } => {
                     let status_str = req_log
@@ -509,6 +567,41 @@ impl App {
                     } else {
                         self.log(LogLevel::Info, &summary);
                     }
+                }
+                AppEvent::LiveChargingSession { session, .. } => {
+                    let live = session.map(|boxed| *boxed);
+                    let vehicle_id = self
+                        .tokens
+                        .as_ref()
+                        .map(|t| t.vehicle_id.clone())
+                        .unwrap_or_else(|| "unknown".into());
+
+                    if let (Some(db), Some(snap)) = (&self.db, live.as_ref()) {
+                        if let Err(e) = db.insert_live_charging_snapshot(&vehicle_id, snap) {
+                            self.log(
+                                LogLevel::Error,
+                                &format!("DB live-session write failed: {e}"),
+                            );
+                        }
+                    }
+
+                    if let Some(snap) = &live {
+                        let power = snap
+                            .power_kw()
+                            .map(|kw| format!("{kw:.1} kW"))
+                            .unwrap_or_else(|| "?".into());
+                        let soc = snap
+                            .soc_percent()
+                            .map(|s| format!("{s:.0}%"))
+                            .unwrap_or_else(|| "?".into());
+                        self.log(
+                            LogLevel::Info,
+                            &format!("Live charging: {power} @ {soc}"),
+                        );
+                    }
+
+                    self.live_charging_session = live;
+                    self.sync_shared_data();
                 }
                 AppEvent::ChargingSessions { sessions, .. } => {
                     let new_sessions = if let Some(db) = &self.db {
@@ -741,6 +834,60 @@ impl App {
         });
     }
 
+    /// Fetch the current live charging session from the charging endpoint.
+    /// Should only be called when the vehicle is actively charging — outside
+    /// of an active session the API returns null and we treat that as "no
+    /// live session" rather than an error.
+    pub fn fetch_live_session(&mut self) {
+        let Some(tokens) = &self.tokens else {
+            return;
+        };
+        let vehicle_id = tokens.vehicle_id.clone();
+        let headers = authenticated_headers(tokens);
+        let tx = self.event_tx.clone();
+        let debug = self.debug;
+        let generation = self.generation;
+
+        tokio::spawn(async move {
+            let client = match Self::make_client(debug, &tx, generation) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Live session fetch failed: {e}"),
+                    });
+                    return;
+                }
+            };
+
+            let vars = serde_json::json!({ "vehicleId": vehicle_id });
+            let result: Result<LiveSessionData, _> = client
+                .graphql(
+                    CHARGING_URL,
+                    "getLiveSessionData",
+                    queries::GET_LIVE_CHARGING_SESSION,
+                    Some(vars),
+                    Some(headers),
+                )
+                .await;
+
+            match result {
+                Ok(data) => {
+                    let _ = tx.send(AppEvent::LiveChargingSession {
+                        generation,
+                        session: data.get_live_session_data.map(Box::new),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Live session: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
     /// Fetch charging session history from the charging endpoint
     pub fn fetch_charging_history(&mut self) {
         let Some(tokens) = &self.tokens else {
@@ -864,6 +1011,8 @@ impl App {
         self.vehicle_state = None;
         self.recent_trend.clear();
         self.last_charge_session = None;
+        self.live_charging_session = None;
+        self.charging_stats = None;
         self.last_update = None;
         self.mfa_state = None;
         self.pending_vehicle_selection = None;
@@ -972,5 +1121,40 @@ mod tests {
 
         assert_eq!(app.log_scroll, scroll);
         assert_eq!(app.log_selected, app.activity_log.len() - 2);
+    }
+
+    #[test]
+    fn new_log_does_not_yank_focus_when_user_scrolled_up() {
+        let mut app = App::new(true, None);
+        for idx in 0..12 {
+            app.log(LogLevel::Info, &format!("log {idx}"));
+        }
+
+        // Scroll back through history.
+        for _ in 0..5 {
+            app.scroll_log_up();
+        }
+        let parked_selected = app.log_selected;
+        let parked_scroll = app.log_scroll;
+
+        // A new log entry arrives while user is reading older history. The
+        // user's selection and scroll position should be preserved — no
+        // unexpected jump to the bottom.
+        app.log(LogLevel::Info, "new entry while reading history");
+
+        assert_eq!(app.log_selected, parked_selected);
+        assert_eq!(app.log_scroll, parked_scroll);
+    }
+
+    #[test]
+    fn new_log_keeps_tailing_when_user_at_bottom() {
+        let mut app = App::new(true, None);
+        for idx in 0..12 {
+            app.log(LogLevel::Info, &format!("log {idx}"));
+        }
+        // Default: focus is on the latest entry, so a new one should still
+        // pin the view to the bottom.
+        app.log(LogLevel::Info, "tail entry");
+        assert_eq!(app.log_selected, app.activity_log.len() - 1);
     }
 }

@@ -789,12 +789,33 @@ fn draw_trend_panel(
         rows[2],
     );
 
-    let motion = format!(
-        "  Now {:.0} mph  Peak {:.0} mph  Alt {:.0} ft",
-        vs.speed_mph().unwrap_or_default(),
-        peak_speed.unwrap_or_default(),
-        vs.altitude_ft().unwrap_or_default(),
-    );
+    let motion = if let Some(stats) = &app.charging_stats {
+        // Use the bottom slot to surface the lifetime charging stats since
+        // there's no other home for them in the current layout.
+        let avg = stats
+            .avg_mi_per_kwh
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "—".into());
+        let best = stats
+            .best_mi_per_kwh
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "—".into());
+        let worst = stats
+            .worst_mi_per_kwh
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "—".into());
+        format!(
+            "  {} chrg  {:.0} kWh  avg {avg}  best {best}  worst {worst} mi/kWh",
+            stats.session_count, stats.total_energy_kwh,
+        )
+    } else {
+        format!(
+            "  Now {:.0} mph  Peak {:.0} mph  Alt {:.0} ft",
+            vs.speed_mph().unwrap_or_default(),
+            peak_speed.unwrap_or_default(),
+            vs.altitude_ft().unwrap_or_default(),
+        )
+    };
     frame.render_widget(
         Paragraph::new(motion).style(Style::default().fg(Color::DarkGray)),
         rows[3],
@@ -844,41 +865,102 @@ fn draw_charge_insights(
     let border = if active { Color::Green } else { Color::Cyan };
 
     let rows = if active {
-        let (battery_delta, range_delta, _, _) = trend_delta(app);
-        vec![
-            kv(
-                W,
-                "State",
-                vs.charger_state_str(),
-                status_color(vs.charger_state_str()),
-            ),
-            kvw(W, "Status", vs.charger_status_str()),
-            kvw(
-                W,
-                "SOC",
-                &format!(
-                    "{:.0}% / {:.0} mi",
-                    vs.battery_percent().unwrap_or_default(),
-                    vs.range_miles().unwrap_or_default()
+        // Prefer the live-session feed when we have it: it carries real
+        // power and per-session energy/efficiency that the vehicle-state
+        // poll does not expose. Fall back to vehicle-state-only display
+        // before the first live response arrives.
+        if let Some(live) = &app.live_charging_session {
+            let power = live
+                .power_kw()
+                .map(|kw| format!("{kw:.1} kW"))
+                .unwrap_or_else(|| "—".into());
+            let energy = live
+                .total_energy_kwh()
+                .map(|v| format!("{v:.1} kWh"))
+                .unwrap_or_else(|| "—".into());
+            let range_added = live
+                .range_added_miles()
+                .map(|v| format!("{v:.0} mi"))
+                .unwrap_or_else(|| "—".into());
+            let efficiency = live
+                .efficiency_mi_per_kwh()
+                .map(|v| format!("{v:.2} mi/kWh"))
+                .unwrap_or_else(|| "—".into());
+            let remaining = live
+                .time_remaining_min()
+                .map(|m| {
+                    let m = m as u64;
+                    if m >= 60 {
+                        format!("{}h {}m", m / 60, m % 60)
+                    } else {
+                        format!("{m}m")
+                    }
+                })
+                .unwrap_or_else(|| "—".into());
+            let charger = live
+                .charger_id
+                .clone()
+                .unwrap_or_else(|| "unknown".into());
+
+            vec![
+                kv(W, "Power", &power, Color::Green),
+                kvw(
+                    W,
+                    "SOC",
+                    &format!(
+                        "{:.0}% / {:.0} mi",
+                        vs.battery_percent().unwrap_or_default(),
+                        vs.range_miles().unwrap_or_default()
+                    ),
                 ),
-            ),
-            kvw(W, "Time", &vs.time_to_full().unwrap_or_else(|| "—".into())),
-            kvw(
-                W,
-                "Trend",
-                &format!(
-                    "ΔSOC {:+.1}%  ΔMi {:+.1}",
-                    battery_delta.unwrap_or_default(),
-                    range_delta.unwrap_or_default()
+                kvw(W, "Added", &format!("{energy} · {range_added}")),
+                kvw(W, "Effcy", &efficiency),
+                kvw(W, "Time", &remaining),
+                kvw(W, "Charger", &charger),
+            ]
+        } else {
+            let (battery_delta, range_delta, _, _) = trend_delta(app);
+            vec![
+                kv(
+                    W,
+                    "State",
+                    vs.charger_state_str(),
+                    status_color(vs.charger_state_str()),
                 ),
-            ),
-            kvw(
-                W,
-                "Where",
-                &vs.location_summary().unwrap_or_else(|| "—".into()),
-            ),
-        ]
+                kvw(W, "Status", vs.charger_status_str()),
+                kvw(
+                    W,
+                    "SOC",
+                    &format!(
+                        "{:.0}% / {:.0} mi",
+                        vs.battery_percent().unwrap_or_default(),
+                        vs.range_miles().unwrap_or_default()
+                    ),
+                ),
+                kvw(W, "Time", &vs.time_to_full().unwrap_or_else(|| "—".into())),
+                kvw(
+                    W,
+                    "Trend",
+                    &format!(
+                        "ΔSOC {:+.1}%  ΔMi {:+.1}",
+                        battery_delta.unwrap_or_default(),
+                        range_delta.unwrap_or_default()
+                    ),
+                ),
+                kvw(
+                    W,
+                    "Where",
+                    &vs.location_summary().unwrap_or_else(|| "—".into()),
+                ),
+            ]
+        }
     } else if let Some(session) = &app.last_charge_session {
+        let efficiency = match (session.range_added_km, session.total_energy_kwh) {
+            (Some(km), Some(kwh)) if kwh > 0.0 && km > 0.0 => {
+                format!("{:.1} mi/kWh", (km / 1.60934) / kwh)
+            }
+            _ => "—".into(),
+        };
         vec![
             kvw(W, "When", &format_charge_time(session)),
             kvw(
@@ -897,15 +979,11 @@ fn draw_charge_insights(
                     .map(|value| format!("{:.0} mi", value / 1.60934))
                     .unwrap_or_else(|| "—".into()),
             ),
+            kvw(W, "Effcy", &efficiency),
             kvw(
                 W,
                 "Site",
                 &session.vendor.clone().unwrap_or_else(|| "unknown".into()),
-            ),
-            kvw(
-                W,
-                "City",
-                &session.city.clone().unwrap_or_else(|| "—".into()),
             ),
             kvw(W, "Type", &format_charge_kind(session)),
         ]

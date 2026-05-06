@@ -54,3 +54,27 @@ serviceMode { value } trailerStatus { value } carWashMode { value } \
 
 /// Charging endpoint — completed session summaries
 pub const GET_CHARGING_SESSIONS: &str = "query getCompletedSessionSummaries { getCompletedSessionSummaries { chargerType currencyCode paidTotal startInstant endInstant totalEnergyKwh rangeAddedKm city transactionId vehicleId vehicleName vendor isRoamingNetwork isPublic isHomeCharger } }";
+
+/// Charging endpoint — live (in-progress) charging session.
+///
+/// `getLiveSessionData` is only meaningful while the vehicle is actively
+/// charging; outside of that the server returns null. Fields ending in
+/// `{ value updatedAt }` are TimeStamped scalars in Rivian's schema; the
+/// remaining fields (chargerId, startTime, etc.) are plain scalars on the
+/// session object itself.
+pub const GET_LIVE_CHARGING_SESSION: &str = "\
+query getLiveSessionData($vehicleId: ID!) { \
+getLiveSessionData(vehicleId: $vehicleId) { \
+__typename \
+chargerId startTime timeElapsed locationId \
+currentPrice currentCurrency isRivianCharger isFreeSession \
+soc { value updatedAt } \
+power { value updatedAt } \
+current { value updatedAt } \
+currentMiles { value updatedAt } \
+kilometersChargedPerHour { value updatedAt } \
+rangeAddedThisSession { value updatedAt } \
+timeRemaining { value updatedAt } \
+totalChargedEnergy { value updatedAt } \
+vehicleChargerState { value updatedAt } \
+} }";

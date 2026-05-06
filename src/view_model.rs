@@ -7,9 +7,9 @@
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
-use crate::api::types::VehicleStateFields;
+use crate::api::types::{LiveChargingSession, VehicleStateFields};
 use crate::app::DashboardData;
-use crate::db::{ChargeSessionSummary, VehicleTrendPoint};
+use crate::db::{ChargeSessionSummary, ChargingStats, VehicleTrendPoint};
 
 /// A flat, pre-formatted view of the dashboard intended for HTML/JSON output.
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +26,8 @@ pub struct DashboardView {
     pub location: LocationView,
     pub trend: Vec<TrendPointView>,
     pub last_charge: Option<ChargeInsightView>,
+    pub live_charge: Option<LiveChargeView>,
+    pub charging_stats: Option<ChargingStatsView>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -102,10 +104,36 @@ pub struct TrendPointView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LiveChargeView {
+    pub power_kw: String,
+    pub soc_percent: String,
+    pub energy_delivered_kwh: String,
+    pub range_added_miles: String,
+    pub session_efficiency: String,
+    pub time_remaining: String,
+    pub charger_id: String,
+    pub charger_state: String,
+    pub started: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChargingStatsView {
+    pub session_count: String,
+    pub total_energy_kwh: String,
+    pub total_range_miles: String,
+    pub avg_mi_per_kwh: String,
+    pub best_mi_per_kwh: String,
+    pub worst_mi_per_kwh: String,
+    pub home_summary: String,
+    pub public_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ChargeInsightView {
     pub when: String,
     pub energy_kwh: String,
     pub range_added_miles: String,
+    pub efficiency_mi_per_kwh: String,
     pub location: String,
     pub charger_type: String,
 }
@@ -141,6 +169,11 @@ impl DashboardView {
                 .last_charge_session
                 .as_ref()
                 .map(ChargeInsightView::from),
+            live_charge: data
+                .live_charging_session
+                .as_ref()
+                .map(LiveChargeView::from),
+            charging_stats: data.charging_stats.as_ref().map(ChargingStatsView::from),
         }
     }
 }
@@ -280,7 +313,7 @@ impl SoftwareView {
     fn from_state(vs: &VehicleStateFields) -> Self {
         fn display(vs: &VehicleStateFields, field: &Option<crate::api::types::StateValue>) -> String {
             let s = vs.get_str(field);
-            if s == "unknown" {
+            if s == "unknown" || s.is_empty() {
                 "—".into()
             } else {
                 s.to_string()
@@ -293,32 +326,60 @@ impl SoftwareView {
             week: &Option<crate::api::types::StateValue>,
         ) -> String {
             match (vs.get_f64(year), vs.get_f64(week)) {
-                (Some(y), Some(w)) => format!("{y:.0}w{w:02.0}"),
+                (Some(y), Some(w)) if y > 0.0 => format!("{y:.0}w{w:02.0}"),
                 _ => "—".into(),
             }
         }
 
         let current = display(vs, &vs.ota_current_version);
-        let available = display(vs, &vs.ota_available_version);
-        let update_available = available != "—" && available != current;
+        let available_raw = display(vs, &vs.ota_available_version);
 
-        let download_progress = vs
+        // Match the TUI: "0.0.0" / "—" / same-as-current all mean "no update".
+        let update_available =
+            available_raw != "—" && available_raw != "0.0.0" && available_raw != current;
+        let available_version = if update_available {
+            available_raw
+        } else {
+            "—".into()
+        };
+        let available_version_date = if update_available {
+            version_date(
+                vs,
+                &vs.ota_available_version_year,
+                &vs.ota_available_version_week,
+            )
+        } else {
+            "—".into()
+        };
+
+        let downloading = vs
             .get_f64(&vs.ota_download_progress)
+            .filter(|v| *v > 0.0);
+        let installing = vs
+            .get_f64(&vs.ota_install_progress)
+            .filter(|v| *v > 0.0);
+
+        let download_progress = downloading
             .map(|v| format!("{v:.0}%"))
             .unwrap_or_else(|| "—".into());
-        let install_progress = vs
-            .get_f64(&vs.ota_install_progress)
+        let install_progress = installing
             .map(|v| format!("{v:.0}%"))
             .unwrap_or_else(|| "—".into());
 
-        let install_ready = match vs.get_boolish(&vs.ota_install_ready) {
-            Some(true) => "ready".into(),
-            Some(false) => "not ready".into(),
-            None => "—".into(),
+        // install_ready is a string on the wire (e.g. "true"/"not_ready"),
+        // so use get_str and normalize.
+        let install_ready = {
+            let raw = vs.get_str(&vs.ota_install_ready);
+            if raw == "unknown" || raw.is_empty() {
+                "—".into()
+            } else {
+                raw.replace('_', " ")
+            }
         };
 
         let install_duration = vs
             .get_f64(&vs.ota_install_duration)
+            .filter(|v| *v > 0.0)
             .map(|mins| {
                 let m = mins as u64;
                 let h = m / 60;
@@ -331,6 +392,19 @@ impl SoftwareView {
             })
             .unwrap_or_else(|| "—".into());
 
+        let install_time = display(vs, &vs.ota_install_time);
+
+        // Progress summary: prefer live download/install %, otherwise "idle"
+        // (the existing helper falls back to install_type which reads weird
+        // when nothing is actually happening).
+        let progress_summary = if let Some(v) = installing {
+            format!("installing {v:.0}%")
+        } else if let Some(v) = downloading {
+            format!("downloading {v:.0}%")
+        } else {
+            "idle".into()
+        };
+
         Self {
             current_version: current,
             current_version_date: version_date(
@@ -338,20 +412,16 @@ impl SoftwareView {
                 &vs.ota_current_version_year,
                 &vs.ota_current_version_week,
             ),
-            available_version: available,
-            available_version_date: version_date(
-                vs,
-                &vs.ota_available_version_year,
-                &vs.ota_available_version_week,
-            ),
+            available_version,
+            available_version_date,
             status: display(vs, &vs.ota_status),
             install_type: display(vs, &vs.ota_install_type),
             install_ready,
             download_progress,
             install_progress,
             install_duration,
-            install_time: display(vs, &vs.ota_install_time),
-            progress_summary: vs.ota_progress_summary().unwrap_or_else(|| "idle".into()),
+            install_time,
+            progress_summary,
             update_available,
         }
     }
@@ -366,7 +436,10 @@ impl LocationView {
                 .altitude_ft()
                 .map(|v| format!("{v:.0} ft"))
                 .unwrap_or_else(|| "—".into()),
-            last_sync: vs.last_sync().unwrap_or("—").to_string(),
+            last_sync: vs
+                .last_sync()
+                .map(humanize_iso)
+                .unwrap_or_else(|| "—".into()),
         }
     }
 }
@@ -385,9 +458,10 @@ impl From<&VehicleTrendPoint> for TrendPointView {
 impl From<&ChargeSessionSummary> for ChargeInsightView {
     fn from(session: &ChargeSessionSummary) -> Self {
         let when = session
-            .start_instant
-            .clone()
-            .or_else(|| session.end_instant.clone())
+            .end_instant
+            .as_deref()
+            .or(session.start_instant.as_deref())
+            .map(humanize_iso)
             .unwrap_or_else(|| "—".into());
 
         let location = match (session.vendor.as_deref(), session.city.as_deref()) {
@@ -409,6 +483,13 @@ impl From<&ChargeSessionSummary> for ChargeInsightView {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "—".into());
 
+        let efficiency_mi_per_kwh = match (session.range_added_km, session.total_energy_kwh) {
+            (Some(km), Some(kwh)) if kwh > 0.0 && km > 0.0 => {
+                format!("{:.1} mi/kWh", (km / 1.60934) / kwh)
+            }
+            _ => "—".into(),
+        };
+
         Self {
             when,
             energy_kwh: session
@@ -419,8 +500,106 @@ impl From<&ChargeSessionSummary> for ChargeInsightView {
                 .range_added_km
                 .map(|km| format!("{:.0} mi", km / 1.60934))
                 .unwrap_or_else(|| "—".into()),
+            efficiency_mi_per_kwh,
             location,
             charger_type,
+        }
+    }
+}
+
+impl From<&LiveChargingSession> for LiveChargeView {
+    fn from(s: &LiveChargingSession) -> Self {
+        let dash = || "—".to_string();
+
+        let power_kw = s
+            .power_kw()
+            .map(|kw| format!("{kw:.1} kW"))
+            .unwrap_or_else(dash);
+        let soc_percent = s
+            .soc_percent()
+            .map(|v| format!("{v:.0}%"))
+            .unwrap_or_else(dash);
+        let energy_delivered_kwh = s
+            .total_energy_kwh()
+            .map(|v| format!("{v:.1} kWh"))
+            .unwrap_or_else(dash);
+        let range_added_miles = s
+            .range_added_miles()
+            .map(|v| format!("{v:.0} mi"))
+            .unwrap_or_else(dash);
+        let session_efficiency = s
+            .efficiency_mi_per_kwh()
+            .map(|v| format!("{v:.1} mi/kWh"))
+            .unwrap_or_else(dash);
+        let time_remaining = s
+            .time_remaining_min()
+            .map(|mins| {
+                let m = mins as u64;
+                if m >= 60 {
+                    format!("{}h {}m", m / 60, m % 60)
+                } else {
+                    format!("{m}m")
+                }
+            })
+            .unwrap_or_else(dash);
+        let charger_id = s.charger_id.clone().unwrap_or_else(dash);
+        let charger_state = s
+            .vehicle_charger_state_str()
+            .map(|s| s.replace('_', " "))
+            .unwrap_or_else(dash);
+        let started = s.start_time.as_deref().map(humanize_iso).unwrap_or_else(dash);
+
+        Self {
+            power_kw,
+            soc_percent,
+            energy_delivered_kwh,
+            range_added_miles,
+            session_efficiency,
+            time_remaining,
+            charger_id,
+            charger_state,
+            started,
+        }
+    }
+}
+
+impl From<&ChargingStats> for ChargingStatsView {
+    fn from(stats: &ChargingStats) -> Self {
+        let fmt_eff = |v: Option<f64>| {
+            v.map(|x| format!("{x:.2} mi/kWh"))
+                .unwrap_or_else(|| "—".into())
+        };
+
+        let home_summary = if stats.home_session_count > 0 {
+            format!(
+                "{} session{} · {}",
+                stats.home_session_count,
+                if stats.home_session_count == 1 { "" } else { "s" },
+                fmt_eff(stats.home_avg_mi_per_kwh),
+            )
+        } else {
+            "no sessions".into()
+        };
+        let public_summary = if stats.public_session_count > 0 {
+            format!(
+                "{} session{} · {}",
+                stats.public_session_count,
+                if stats.public_session_count == 1 { "" } else { "s" },
+                fmt_eff(stats.public_avg_mi_per_kwh),
+            )
+        } else {
+            "no sessions".into()
+        };
+
+        Self {
+            session_count: stats.session_count.to_string(),
+            total_energy_kwh: format!("{:.0} kWh", stats.total_energy_kwh),
+            total_range_miles: format!("{:.0} mi", stats.total_range_km / 1.60934),
+            avg_mi_per_kwh: fmt_eff(stats.avg_mi_per_kwh),
+            best_mi_per_kwh: fmt_eff(stats.best_mi_per_kwh),
+            worst_mi_per_kwh: fmt_eff(stats.worst_mi_per_kwh),
+            home_summary,
+            public_summary,
         }
     }
 }
@@ -430,18 +609,38 @@ fn format_last_update(ts: Option<DateTime<Utc>>) -> String {
         return "never".to_string();
     };
     let local: DateTime<Local> = ts.into();
-    let now = Utc::now();
-    let elapsed = now.signed_duration_since(ts);
-    let rel = if elapsed.num_seconds() < 60 {
-        "just now".to_string()
+    format!("{} ({})", local.format("%Y-%m-%d %H:%M:%S"), relative_age(ts))
+}
+
+fn relative_age(ts: DateTime<Utc>) -> String {
+    let elapsed = Utc::now().signed_duration_since(ts);
+    let secs = elapsed.num_seconds();
+    if secs < 0 {
+        // Clock skew or future timestamp — fall back to a stable label.
+        return "just now".into();
+    }
+    if secs < 60 {
+        "just now".into()
     } else if elapsed.num_minutes() < 60 {
         format!("{}m ago", elapsed.num_minutes())
     } else if elapsed.num_hours() < 24 {
         format!("{}h ago", elapsed.num_hours())
     } else {
         format!("{}d ago", elapsed.num_days())
-    };
-    format!("{} ({})", local.format("%Y-%m-%d %H:%M:%S"), rel)
+    }
+}
+
+/// Format an RFC3339 timestamp as local-time + relative age. Falls back to
+/// the original string if parsing fails so we never silently lose data.
+fn humanize_iso(ts: &str) -> String {
+    match DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => {
+            let utc = dt.with_timezone(&Utc);
+            let local: DateTime<Local> = utc.into();
+            format!("{} ({})", local.format("%b %d %H:%M"), relative_age(utc))
+        }
+        Err(_) => ts.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -470,5 +669,23 @@ mod tests {
         let view = DashboardView::from_data(&data);
         assert!(!view.has_data);
         assert_eq!(view.last_update_human, "never");
+    }
+
+    #[test]
+    fn humanize_iso_returns_input_for_unparseable_string() {
+        assert_eq!(humanize_iso("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn humanize_iso_renders_local_time_for_valid_rfc3339() {
+        let formatted = humanize_iso("2026-02-28T15:34:30Z");
+        assert!(
+            formatted.contains("(") && formatted.contains("ago"),
+            "expected relative age suffix, got {formatted}"
+        );
+        assert!(
+            !formatted.contains("2026-02-28T"),
+            "raw RFC3339 must not leak through, got {formatted}"
+        );
     }
 }

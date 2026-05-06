@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::api::types::{ChargingSession, VehicleStateFields};
+use crate::api::types::{ChargingSession, LiveChargingSession, VehicleStateFields};
 
 const DB_NAME: &str = "rivian.db";
 
@@ -32,6 +32,24 @@ pub struct ChargeSessionSummary {
     pub charger_type: Option<String>,
     pub is_public: Option<bool>,
     pub is_home_charger: Option<bool>,
+}
+
+/// Lifetime / aggregate charging statistics derived from `charging_sessions`.
+/// Sessions with implausibly small range or energy are filtered out before
+/// the mi/kWh ratios are computed so a single bogus row doesn't dominate
+/// "best" / "worst".
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChargingStats {
+    pub session_count: i64,
+    pub total_energy_kwh: f64,
+    pub total_range_km: f64,
+    pub avg_mi_per_kwh: Option<f64>,
+    pub best_mi_per_kwh: Option<f64>,
+    pub worst_mi_per_kwh: Option<f64>,
+    pub home_session_count: i64,
+    pub home_avg_mi_per_kwh: Option<f64>,
+    pub public_session_count: i64,
+    pub public_avg_mi_per_kwh: Option<f64>,
 }
 
 fn charging_session_dedupe_key(session: &ChargingSession) -> String {
@@ -205,7 +223,32 @@ impl Db {
             );
 
             CREATE INDEX IF NOT EXISTS idx_cs_start ON charging_sessions(start_instant);
-            CREATE INDEX IF NOT EXISTS idx_cs_txn ON charging_sessions(transaction_id);",
+            CREATE INDEX IF NOT EXISTS idx_cs_txn ON charging_sessions(transaction_id);
+
+            CREATE TABLE IF NOT EXISTS live_charging_snapshots (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                vehicle_id      TEXT,
+                charger_id      TEXT,
+                session_start   TEXT,
+                vehicle_charger_state TEXT,
+                soc             REAL,
+                power_kw        REAL,
+                current_a       REAL,
+                total_energy_kwh REAL,
+                range_added_km  REAL,
+                kilometers_per_hour REAL,
+                time_remaining_min REAL,
+                time_elapsed_sec INTEGER,
+                current_price   REAL,
+                is_rivian_charger INTEGER,
+                is_free_session INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lcs_vehicle_ts
+                ON live_charging_snapshots(vehicle_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_lcs_session
+                ON live_charging_snapshots(vehicle_id, session_start);",
         )?;
 
         // Add columns that may not exist in older DBs
@@ -439,21 +482,31 @@ impl Db {
         Ok(count)
     }
 
+    /// Return vehicle trend samples fetched within the last `hours` hours,
+    /// ordered oldest to newest. Limited to a hard cap to avoid runaway
+    /// result sizes if someone lowers the poll interval dramatically.
     pub fn recent_vehicle_trend(
         &self,
         vehicle_id: &str,
-        limit: usize,
+        hours: u32,
     ) -> Result<Vec<VehicleTrendPoint>> {
-        let mut stmt = self.conn.prepare(
+        const HARD_CAP: i64 = 2000;
+
+        // `hours` is a trusted u32 — safe to interpolate into the datetime
+        // modifier. SQLite does not accept bound parameters inside the
+        // strftime modifier list.
+        let sql = format!(
             "SELECT battery_level, distance_to_empty_km, vehicle_mileage_m, speed
              FROM vehicle_state
              WHERE vehicle_id = ?1
-             ORDER BY id DESC
-             LIMIT ?2",
-        )?;
+               AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{hours} hours')
+             ORDER BY id ASC
+             LIMIT ?2"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
 
-        let mut points: Vec<VehicleTrendPoint> = stmt
-            .query_map((vehicle_id, limit as i64), |row| {
+        let points: Vec<VehicleTrendPoint> = stmt
+            .query_map((vehicle_id, HARD_CAP), |row| {
                 Ok(VehicleTrendPoint {
                     battery_level: row.get(0)?,
                     range_km: row.get(1)?,
@@ -463,7 +516,6 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        points.reverse();
         Ok(points)
     }
 
@@ -499,6 +551,122 @@ impl Db {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Insert a single live-charging snapshot. Caller decides cadence — we
+    /// never deduplicate here because two consecutive samples with the same
+    /// values are still useful for time-series plotting.
+    pub fn insert_live_charging_snapshot(
+        &self,
+        vehicle_id: &str,
+        snap: &LiveChargingSession,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO live_charging_snapshots (
+                vehicle_id, charger_id, session_start, vehicle_charger_state,
+                soc, power_kw, current_a, total_energy_kwh, range_added_km,
+                kilometers_per_hour, time_remaining_min, time_elapsed_sec,
+                current_price, is_rivian_charger, is_free_session
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            rusqlite::params![
+                vehicle_id,
+                snap.charger_id,
+                snap.start_time,
+                snap.vehicle_charger_state_str(),
+                snap.soc_percent(),
+                snap.power_kw(),
+                snap.current_amps(),
+                snap.total_energy_kwh(),
+                snap.range_added_km(),
+                snap.kilometers_charged_per_hour
+                    .as_ref()
+                    .and_then(|v| v.as_f64()),
+                snap.time_remaining_min(),
+                snap.time_elapsed,
+                snap.current_price,
+                snap.is_rivian_charger.map(|b| b as i64),
+                snap.is_free_session.map(|b| b as i64),
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Aggregate completed-charging stats for a vehicle. Only sessions with
+    /// realistic energy (>0.5 kWh) and range (>0.5 km) values contribute to
+    /// the mi/kWh ratios; cancelled or sub-minute sessions otherwise produce
+    /// junk efficiency numbers.
+    pub fn charging_session_stats(&self, vehicle_id: &str) -> Result<Option<ChargingStats>> {
+        // 1. totals across the whole history
+        let (count, total_energy, total_range): (i64, f64, f64) = self.conn.query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(total_energy_kwh), 0),
+                COALESCE(SUM(range_added_km), 0)
+             FROM charging_sessions
+             WHERE vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = ''",
+            [vehicle_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+
+        if count == 0 {
+            return Ok(None);
+        }
+
+        // 2. mi/kWh aggregates filtered to realistic sessions
+        let efficiency_sql = "SELECT
+                AVG(range_km / 1.60934 / energy_kwh),
+                MAX(range_km / 1.60934 / energy_kwh),
+                MIN(range_km / 1.60934 / energy_kwh)
+             FROM (
+                SELECT total_energy_kwh AS energy_kwh, range_added_km AS range_km
+                FROM charging_sessions
+                WHERE (vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = '')
+                  AND total_energy_kwh > 0.5
+                  AND range_added_km > 0.5
+             )";
+        let (avg_eff, best_eff, worst_eff): (Option<f64>, Option<f64>, Option<f64>) =
+            self.conn.query_row(efficiency_sql, [vehicle_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+
+        // 3. home vs public bucket averages
+        let bucket_avg = |home: bool| -> Result<(i64, Option<f64>)> {
+            let where_clause = if home {
+                "is_home_charger = 1"
+            } else {
+                "is_home_charger = 0 OR is_home_charger IS NULL"
+            };
+            let sql = format!(
+                "SELECT
+                    COUNT(*),
+                    AVG(CASE WHEN total_energy_kwh > 0.5 AND range_added_km > 0.5
+                              THEN range_added_km / 1.60934 / total_energy_kwh
+                              ELSE NULL END)
+                 FROM charging_sessions
+                 WHERE (vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = '')
+                   AND ({where_clause})"
+            );
+            let row: (i64, Option<f64>) = self
+                .conn
+                .query_row(&sql, [vehicle_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(row)
+        };
+
+        let (home_count, home_avg) = bucket_avg(true)?;
+        let (public_count, public_avg) = bucket_avg(false)?;
+
+        Ok(Some(ChargingStats {
+            session_count: count,
+            total_energy_kwh: total_energy,
+            total_range_km: total_range,
+            avg_mi_per_kwh: avg_eff,
+            best_mi_per_kwh: best_eff,
+            worst_mi_per_kwh: worst_eff,
+            home_session_count: home_count,
+            home_avg_mi_per_kwh: home_avg,
+            public_session_count: public_count,
+            public_avg_mi_per_kwh: public_avg,
+        }))
     }
 
     /// Get a reference to the underlying connection (for future chat/query use)
@@ -665,6 +833,138 @@ mod tests {
         let latest = db.latest_charging_session("vehicle-1").unwrap().unwrap();
         assert_eq!(latest.vendor.as_deref(), Some("Rivian"));
         assert_eq!(latest.city.as_deref(), Some("Denver"));
+    }
+
+    #[test]
+    fn live_snapshot_round_trip() {
+        let db = make_test_db();
+
+        let json = r#"{
+            "chargerId": "RAN-42",
+            "startTime": "2026-05-06T10:00:00Z",
+            "timeElapsed": 1820,
+            "currentPrice": 0.18,
+            "isRivianCharger": true,
+            "isFreeSession": false,
+            "soc": { "value": 64.5, "updatedAt": "2026-05-06T10:30:00Z" },
+            "power": { "value": 142.7, "updatedAt": "2026-05-06T10:30:00Z" },
+            "current": { "value": 320.0, "updatedAt": "2026-05-06T10:30:00Z" },
+            "totalChargedEnergy": { "value": 31.4, "updatedAt": "2026-05-06T10:30:00Z" },
+            "rangeAddedThisSession": { "value": 161.0, "updatedAt": "2026-05-06T10:30:00Z" },
+            "vehicleChargerState": { "value": "charging_active", "updatedAt": "2026-05-06T10:30:00Z" }
+        }"#;
+        let snap: LiveChargingSession = serde_json::from_str(json).unwrap();
+        let id = db.insert_live_charging_snapshot("VIN-1", &snap).unwrap();
+        assert!(id > 0);
+
+        let row: (String, Option<String>, f64, f64, f64) = db
+            .conn()
+            .query_row(
+                "SELECT vehicle_id, charger_id, soc, power_kw, total_energy_kwh
+                 FROM live_charging_snapshots WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "VIN-1");
+        assert_eq!(row.1.as_deref(), Some("RAN-42"));
+        assert!((row.2 - 64.5).abs() < 0.01);
+        assert!((row.3 - 142.7).abs() < 0.01);
+        assert!((row.4 - 31.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn charging_session_stats_separates_home_and_public() {
+        let db = make_test_db();
+
+        // Home: 50 kWh -> 200 km -> 124 mi -> 2.49 mi/kWh
+        // Public DC fast: 30 kWh -> 90 km -> 56 mi -> 1.86 mi/kWh
+        // Public AC: 20 kWh -> 100 km -> 62 mi -> 3.11 mi/kWh
+        let sessions = vec![
+            ChargingSession {
+                transaction_id: Some("home-1".into()),
+                vehicle_id: Some("VIN-1".into()),
+                total_energy_kwh: Some(50.0),
+                range_added_km: Some(200.0),
+                is_home_charger: Some(true),
+                charger_type: Some("home".into()),
+                ..test_charging_session()
+            },
+            ChargingSession {
+                transaction_id: Some("public-dc-1".into()),
+                vehicle_id: Some("VIN-1".into()),
+                total_energy_kwh: Some(30.0),
+                range_added_km: Some(90.0),
+                is_home_charger: Some(false),
+                is_public: Some(true),
+                charger_type: Some("RAN".into()),
+                ..test_charging_session()
+            },
+            ChargingSession {
+                transaction_id: Some("public-ac-1".into()),
+                vehicle_id: Some("VIN-1".into()),
+                total_energy_kwh: Some(20.0),
+                range_added_km: Some(100.0),
+                is_home_charger: Some(false),
+                is_public: Some(true),
+                charger_type: Some("ChargePoint".into()),
+                ..test_charging_session()
+            },
+            // Junk session — should be filtered out of efficiency math.
+            ChargingSession {
+                transaction_id: Some("junk".into()),
+                vehicle_id: Some("VIN-1".into()),
+                total_energy_kwh: Some(0.1),
+                range_added_km: Some(50.0),
+                is_home_charger: Some(false),
+                charger_type: Some("Unknown".into()),
+                ..test_charging_session()
+            },
+        ];
+        db.upsert_charging_sessions(&sessions).unwrap();
+
+        let stats = db.charging_session_stats("VIN-1").unwrap().unwrap();
+        assert_eq!(stats.session_count, 4);
+        assert!((stats.total_energy_kwh - 100.1).abs() < 0.01);
+        assert!((stats.total_range_km - 440.0).abs() < 0.01);
+
+        // Best across realistic sessions = public-ac (3.11 mi/kWh).
+        let best = stats.best_mi_per_kwh.unwrap();
+        assert!((best - 100.0 / 1.60934 / 20.0).abs() < 0.01, "got {best}");
+        // Worst = public-dc (1.86 mi/kWh).
+        let worst = stats.worst_mi_per_kwh.unwrap();
+        assert!((worst - 90.0 / 1.60934 / 30.0).abs() < 0.01);
+
+        assert_eq!(stats.home_session_count, 1);
+        assert_eq!(stats.public_session_count, 3);
+        let home = stats.home_avg_mi_per_kwh.unwrap();
+        assert!((home - 200.0 / 1.60934 / 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn charging_session_stats_returns_none_when_empty() {
+        let db = make_test_db();
+        assert!(db.charging_session_stats("VIN-1").unwrap().is_none());
+    }
+
+    fn test_charging_session() -> ChargingSession {
+        ChargingSession {
+            charger_type: None,
+            currency_code: Some("USD".into()),
+            paid_total: Some(0.0),
+            start_instant: Some("2026-05-01T10:00:00Z".into()),
+            end_instant: Some("2026-05-01T11:00:00Z".into()),
+            total_energy_kwh: None,
+            range_added_km: None,
+            city: Some("Seattle".into()),
+            transaction_id: None,
+            vehicle_id: None,
+            vehicle_name: Some("R1T".into()),
+            vendor: Some("Rivian".into()),
+            is_roaming_network: Some(false),
+            is_public: Some(false),
+            is_home_charger: Some(false),
+        }
     }
 
     #[test]

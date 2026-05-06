@@ -150,6 +150,122 @@ pub struct ChargingSession {
     pub is_home_charger: Option<bool>,
 }
 
+// --- Live Charging Session ---
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSessionData {
+    pub get_live_session_data: Option<LiveChargingSession>,
+}
+
+/// A single live charging session record. Fields with the `TsValue` shape
+/// come back from the server as `{ value, updatedAt }` records; plain
+/// scalars come back inline.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveChargingSession {
+    // Plain scalars
+    pub charger_id: Option<String>,
+    pub start_time: Option<String>,
+    pub time_elapsed: Option<i64>,
+    pub location_id: Option<String>,
+    pub current_price: Option<f64>,
+    pub current_currency: Option<String>,
+    pub is_rivian_charger: Option<bool>,
+    pub is_free_session: Option<bool>,
+
+    // TimeStamped value records
+    pub soc: Option<TsValue>,
+    pub power: Option<TsValue>,
+    pub current: Option<TsValue>,
+    pub current_miles: Option<TsValue>,
+    pub kilometers_charged_per_hour: Option<TsValue>,
+    pub range_added_this_session: Option<TsValue>,
+    pub time_remaining: Option<TsValue>,
+    pub total_charged_energy: Option<TsValue>,
+    pub vehicle_charger_state: Option<TsValue>,
+}
+
+/// Wire shape for Rivian's `TimeStamped*` scalars: `{ value, updatedAt }`.
+/// The `value` is intentionally `serde_json::Value` because the API mixes
+/// numeric and string representations across fields — same trick we use for
+/// `StateValue` on the vehicle-state side.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TsValue {
+    #[serde(default)]
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl TsValue {
+    pub fn as_f64(&self) -> Option<f64> {
+        match &self.value {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        self.value.as_str()
+    }
+}
+
+impl LiveChargingSession {
+    pub fn power_kw(&self) -> Option<f64> {
+        self.power.as_ref().and_then(|v| v.as_f64())
+    }
+
+    pub fn soc_percent(&self) -> Option<f64> {
+        self.soc.as_ref().and_then(|v| v.as_f64())
+    }
+
+    /// Total energy delivered this session, in kWh.
+    pub fn total_energy_kwh(&self) -> Option<f64> {
+        self.total_charged_energy
+            .as_ref()
+            .and_then(|v| v.as_f64())
+    }
+
+    /// Range added this session, in km.
+    pub fn range_added_km(&self) -> Option<f64> {
+        self.range_added_this_session
+            .as_ref()
+            .and_then(|v| v.as_f64())
+    }
+
+    pub fn current_amps(&self) -> Option<f64> {
+        self.current.as_ref().and_then(|v| v.as_f64())
+    }
+
+    pub fn time_remaining_min(&self) -> Option<f64> {
+        self.time_remaining.as_ref().and_then(|v| v.as_f64())
+    }
+
+    pub fn vehicle_charger_state_str(&self) -> Option<&str> {
+        self.vehicle_charger_state.as_ref().and_then(|v| v.as_str())
+    }
+
+    pub fn range_added_miles(&self) -> Option<f64> {
+        self.range_added_km().map(|km| km / 1.60934)
+    }
+
+    /// mi/kWh observed so far in this session. Returns None until both range
+    /// and energy have crossed a small noise floor — early in a session
+    /// either denominator is near zero and the ratio explodes.
+    pub fn efficiency_mi_per_kwh(&self) -> Option<f64> {
+        let mi = self.range_added_miles()?;
+        let kwh = self.total_energy_kwh()?;
+        if kwh > 0.5 && mi > 0.5 {
+            Some(mi / kwh)
+        } else {
+            None
+        }
+    }
+}
+
 // --- Vehicle State ---
 
 #[derive(Debug, Deserialize)]
@@ -470,9 +586,33 @@ impl VehicleStateFields {
     }
 
     pub fn is_actively_charging(&self) -> bool {
+        // chargerState values are tokens like "charging_active", "charging_ready",
+        // "charging_inactive". A naive substring("active") match treats
+        // "charging_inactive" as active because "inactive" contains "active".
+        // Split into tokens and look for an exact match instead.
         let state = self.charger_state_str().to_ascii_lowercase();
+        if state.split('_').any(|tok| tok == "active") {
+            return true;
+        }
+
+        // chargerStatus uses "chrgr_sts_*" tokens — e.g. "chrgr_sts_charging".
+        // "chrgr_sts_not_charging" must not match, so look for a "charging"
+        // token that isn't preceded by "not".
         let status = self.charger_status_str().to_ascii_lowercase();
-        state.contains("active") || status.contains("charging")
+        let toks: Vec<&str> = status.split('_').collect();
+        for (i, tok) in toks.iter().enumerate() {
+            if *tok == "charging" {
+                let preceded_by_not = i
+                    .checked_sub(1)
+                    .and_then(|j| toks.get(j))
+                    .copied()
+                    == Some("not");
+                if !preceded_by_not {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     #[cfg(test)]
@@ -698,6 +838,136 @@ mod tests {
         // distanceToEmpty is in km
         assert!((vs.range_miles().unwrap() - 198.5 / 1.60934).abs() < 0.1);
         assert_eq!(vs.power_state_str(), "sleep");
+    }
+
+    #[test]
+    fn deserialize_live_charging_session() {
+        // Shape mirrors what the charging endpoint returns while a session
+        // is in progress. Plain scalars sit alongside TimeStamped {value,
+        // updatedAt} records for fields like power, soc, totalChargedEnergy.
+        let json = r#"{
+            "data": {
+                "getLiveSessionData": {
+                    "__typename": "LiveSessionData",
+                    "chargerId": "RAN-CHRG-42",
+                    "startTime": "2026-05-06T10:00:00.000Z",
+                    "timeElapsed": 1820,
+                    "locationId": "loc-1",
+                    "currentPrice": 0.18,
+                    "currentCurrency": "USD",
+                    "isRivianCharger": true,
+                    "isFreeSession": false,
+                    "soc": { "value": 64.5, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "power": { "value": 142.7, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "current": { "value": 320.0, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "currentMiles": { "value": 213.0, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "kilometersChargedPerHour": { "value": 480.0, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "rangeAddedThisSession": { "value": 161.0, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "timeRemaining": { "value": 22.0, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "totalChargedEnergy": { "value": 31.4, "updatedAt": "2026-05-06T10:30:00Z" },
+                    "vehicleChargerState": { "value": "charging_active", "updatedAt": "2026-05-06T10:30:00Z" }
+                }
+            }
+        }"#;
+
+        let resp: GraphQlResponse<LiveSessionData> = serde_json::from_str(json).unwrap();
+        let session = resp.data.unwrap().get_live_session_data.unwrap();
+
+        assert_eq!(session.charger_id.as_deref(), Some("RAN-CHRG-42"));
+        assert_eq!(session.is_rivian_charger, Some(true));
+        assert!((session.power_kw().unwrap() - 142.7).abs() < 0.01);
+        assert!((session.soc_percent().unwrap() - 64.5).abs() < 0.01);
+        assert!((session.total_energy_kwh().unwrap() - 31.4).abs() < 0.01);
+        assert!((session.range_added_km().unwrap() - 161.0).abs() < 0.01);
+        // 161 km / 1.60934 / 31.4 kWh ≈ 3.18 mi/kWh
+        assert!((session.efficiency_mi_per_kwh().unwrap() - 3.186).abs() < 0.05);
+        assert_eq!(session.vehicle_charger_state_str(), Some("charging_active"));
+    }
+
+    #[test]
+    fn live_session_efficiency_filters_out_noise_floor() {
+        let mut session = LiveChargingSession {
+            range_added_this_session: Some(TsValue {
+                value: serde_json::json!(0.1),
+                updated_at: None,
+            }),
+            total_charged_energy: Some(TsValue {
+                value: serde_json::json!(0.1),
+                updated_at: None,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            session.efficiency_mi_per_kwh().is_none(),
+            "tiny numerator/denominator should be filtered to None"
+        );
+
+        // After enough has flowed, efficiency becomes meaningful.
+        session.total_charged_energy = Some(TsValue {
+            value: serde_json::json!(10.0),
+            updated_at: None,
+        });
+        session.range_added_this_session = Some(TsValue {
+            value: serde_json::json!(50.0),
+            updated_at: None,
+        });
+        assert!(session.efficiency_mi_per_kwh().is_some());
+    }
+
+    #[test]
+    fn live_session_data_is_null_when_not_charging() {
+        let json = r#"{ "data": { "getLiveSessionData": null } }"#;
+        let resp: GraphQlResponse<LiveSessionData> = serde_json::from_str(json).unwrap();
+        assert!(resp.data.unwrap().get_live_session_data.is_none());
+    }
+
+    #[test]
+    fn is_actively_charging_distinguishes_active_from_inactive() {
+        let active = VehicleStateFields {
+            charger_state: Some(StateValue {
+                value: serde_json::json!("charging_active"),
+            }),
+            ..Default::default()
+        };
+        assert!(active.is_actively_charging());
+
+        let inactive = VehicleStateFields {
+            charger_state: Some(StateValue {
+                value: serde_json::json!("charging_inactive"),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !inactive.is_actively_charging(),
+            "charging_inactive must not be reported as actively charging"
+        );
+
+        let ready = VehicleStateFields {
+            charger_state: Some(StateValue {
+                value: serde_json::json!("charging_ready"),
+            }),
+            ..Default::default()
+        };
+        assert!(!ready.is_actively_charging());
+
+        let by_status = VehicleStateFields {
+            charger_status: Some(StateValue {
+                value: serde_json::json!("chrgr_sts_charging"),
+            }),
+            ..Default::default()
+        };
+        assert!(by_status.is_actively_charging());
+
+        let not_charging_status = VehicleStateFields {
+            charger_status: Some(StateValue {
+                value: serde_json::json!("chrgr_sts_not_charging"),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !not_charging_status.is_actively_charging(),
+            "chrgr_sts_not_charging must not be reported as actively charging"
+        );
     }
 
     #[test]

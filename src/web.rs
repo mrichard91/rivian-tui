@@ -225,8 +225,60 @@ fn render_html(view: &DashboardView) -> String {
     let sw_badge = if sw.update_available {
         r#"<span class="badge warn">update available</span>"#
     } else {
-        ""
+        r#"<span class="badge idle">up to date</span>"#
     };
+
+    let mut sw_rows = String::new();
+    if sw.update_available {
+        let _ = write!(
+            sw_rows,
+            "<dt>Available</dt><dd>{available} <span class=\"muted\">{date}</span></dd>",
+            available = escape(&sw.available_version),
+            date = escape(&sw.available_version_date),
+        );
+    }
+    let _ = write!(
+        sw_rows,
+        "<dt>Status</dt><dd>{}</dd>",
+        escape(&sw.status)
+    );
+    let _ = write!(
+        sw_rows,
+        "<dt>Install type</dt><dd>{}</dd>",
+        escape(&sw.install_type)
+    );
+    let _ = write!(
+        sw_rows,
+        "<dt>Progress</dt><dd>{}</dd>",
+        escape(&sw.progress_summary)
+    );
+
+    // Only surface the install-detail rows when there's actually a pending
+    // install — otherwise they're all placeholders.
+    let installing = sw.install_progress != "—" || sw.install_ready != "—";
+    if installing {
+        let _ = write!(
+            sw_rows,
+            "<dt>Install ready</dt><dd>{}</dd>",
+            escape(&sw.install_ready)
+        );
+        let _ = write!(
+            sw_rows,
+            "<dt>Download</dt><dd>{}</dd>",
+            escape(&sw.download_progress)
+        );
+        let _ = write!(
+            sw_rows,
+            "<dt>Install</dt><dd>{}</dd>",
+            escape(&sw.install_progress)
+        );
+        let _ = write!(
+            sw_rows,
+            "<dt>Duration</dt><dd>{}</dd>",
+            escape(&sw.install_duration)
+        );
+    }
+
     let _ = write!(
         body,
         r#"<section class="card">
@@ -234,29 +286,14 @@ fn render_html(view: &DashboardView) -> String {
   <div class="big version">{current}</div>
   <div class="muted">{current_date}</div>
   <dl>
-    <dt>Available</dt><dd>{available} <span class="muted">{available_date}</span></dd>
-    <dt>Status</dt><dd>{status}</dd>
-    <dt>Install type</dt><dd>{install_type}</dd>
-    <dt>Install ready</dt><dd>{install_ready}</dd>
-    <dt>Download</dt><dd>{download}</dd>
-    <dt>Install</dt><dd>{install}</dd>
-    <dt>Duration</dt><dd>{duration}</dd>
-    <dt>Progress</dt><dd>{summary}</dd>
+{rows}
   </dl>
 </section>
 "#,
         badge = sw_badge,
         current = escape(&sw.current_version),
         current_date = escape(&sw.current_version_date),
-        available = escape(&sw.available_version),
-        available_date = escape(&sw.available_version_date),
-        status = escape(&sw.status),
-        install_type = escape(&sw.install_type),
-        install_ready = escape(&sw.install_ready),
-        download = escape(&sw.download_progress),
-        install = escape(&sw.install_progress),
-        duration = escape(&sw.install_duration),
-        summary = escape(&sw.progress_summary),
+        rows = sw_rows,
     );
 
     // Location card
@@ -278,6 +315,65 @@ fn render_html(view: &DashboardView) -> String {
         sync = escape(&view.location.last_sync),
     );
 
+    // Live charge card — only appears while a session is in progress.
+    if let Some(live) = &view.live_charge {
+        let _ = write!(
+            body,
+            r#"<section class="card">
+  <h2>Live charge <span class="badge active">in progress</span></h2>
+  <div class="big">{power}</div>
+  <div class="muted">{charger} · {state}</div>
+  <dl>
+    <dt>SOC</dt><dd>{soc}</dd>
+    <dt>Energy added</dt><dd>{energy}</dd>
+    <dt>Range added</dt><dd>{range}</dd>
+    <dt>Session mi/kWh</dt><dd>{eff}</dd>
+    <dt>Time remaining</dt><dd>{rem}</dd>
+    <dt>Started</dt><dd>{started}</dd>
+  </dl>
+</section>
+"#,
+            power = escape(&live.power_kw),
+            charger = escape(&live.charger_id),
+            state = escape(&live.charger_state),
+            soc = escape(&live.soc_percent),
+            energy = escape(&live.energy_delivered_kwh),
+            range = escape(&live.range_added_miles),
+            eff = escape(&live.session_efficiency),
+            rem = escape(&live.time_remaining),
+            started = escape(&live.started),
+        );
+    }
+
+    // Charging stats card
+    if let Some(stats) = &view.charging_stats {
+        let _ = write!(
+            body,
+            r#"<section class="card">
+  <h2>Charging stats</h2>
+  <div class="big">{avg}</div>
+  <div class="muted">lifetime average · {count} sessions</div>
+  <dl>
+    <dt>Total energy</dt><dd>{energy}</dd>
+    <dt>Total range</dt><dd>{range}</dd>
+    <dt>Best</dt><dd>{best}</dd>
+    <dt>Worst</dt><dd>{worst}</dd>
+    <dt>Home</dt><dd>{home}</dd>
+    <dt>Public</dt><dd>{public}</dd>
+  </dl>
+</section>
+"#,
+            avg = escape(&stats.avg_mi_per_kwh),
+            count = escape(&stats.session_count),
+            energy = escape(&stats.total_energy_kwh),
+            range = escape(&stats.total_range_miles),
+            best = escape(&stats.best_mi_per_kwh),
+            worst = escape(&stats.worst_mi_per_kwh),
+            home = escape(&stats.home_summary),
+            public = escape(&stats.public_summary),
+        );
+    }
+
     // Last charge card
     if let Some(ch) = &view.last_charge {
         let _ = write!(
@@ -288,6 +384,7 @@ fn render_html(view: &DashboardView) -> String {
     <dt>When</dt><dd>{when}</dd>
     <dt>Energy</dt><dd>{energy}</dd>
     <dt>Range added</dt><dd>{range}</dd>
+    <dt>Efficiency</dt><dd>{eff}</dd>
     <dt>Location</dt><dd>{loc}</dd>
     <dt>Charger</dt><dd>{kind}</dd>
   </dl>
@@ -296,6 +393,7 @@ fn render_html(view: &DashboardView) -> String {
             when = escape(&ch.when),
             energy = escape(&ch.energy_kwh),
             range = escape(&ch.range_added_miles),
+            eff = escape(&ch.efficiency_mi_per_kwh),
             loc = escape(&ch.location),
             kind = escape(&ch.charger_type),
         );
@@ -318,25 +416,79 @@ fn render_trend_svg(points: &[crate::view_model::TrendPointView]) -> String {
     let height = 140.0;
     let pad = 8.0;
 
-    let samples: Vec<f64> = points
-        .iter()
-        .filter_map(|p| p.battery_percent)
-        .collect();
-
-    if samples.len() < 2 {
+    let battery: Vec<f64> = points.iter().filter_map(|p| p.battery_percent).collect();
+    if battery.len() < 2 {
         return r#"<p class="muted">Not enough data yet.</p>"#.to_string();
     }
 
-    // Fixed y-axis: battery percent is always 0–100.
-    let min = 0.0_f64;
-    let max = 100.0_f64;
-    let range = max - min;
-    let step = (width - pad * 2.0) / (samples.len() as f64 - 1.0).max(1.0);
-    let observed_min = samples.iter().copied().fold(f64::INFINITY, f64::min);
-    let observed_max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // Battery axis is fixed 0–100 so the line stays comparable across sessions.
+    let battery_path = build_path(&battery, 0.0, 100.0, width, height, pad);
+    let observed_min = battery.iter().copied().fold(f64::INFINITY, f64::min);
+    let observed_max = battery.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
+    // Range trend uses an autoscaled axis so the curve shape is visible even
+    // when the absolute range bouncs around inside a small band. We render
+    // it on the same chart in a different color so the two metrics can be
+    // compared at a glance.
+    let range: Vec<f64> = points.iter().filter_map(|p| p.range_miles).collect();
+    let range_path = if range.len() >= 2 {
+        let r_min = range.iter().copied().fold(f64::INFINITY, f64::min);
+        let r_max = range.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let (lo, hi) = if (r_max - r_min).abs() < 1.0 {
+            // Avoid a flat span collapsing to zero height.
+            (r_min - 1.0, r_max + 1.0)
+        } else {
+            (r_min, r_max)
+        };
+        Some((build_path(&range, lo, hi, width, height, pad), r_min, r_max))
+    } else {
+        None
+    };
+
+    let mut svg = String::new();
+    let _ = write!(
+        svg,
+        r##"<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" class="trend">
+  <line x1="{pad}" y1="{pad}" x2="{xr}" y2="{pad}" stroke="#1f2a36" stroke-width="1"/>
+  <line x1="{pad}" y1="{ymid:.1}" x2="{xr}" y2="{ymid:.1}" stroke="#1f2a36" stroke-width="1" stroke-dasharray="2,3"/>
+  <line x1="{pad}" y1="{yb}" x2="{xr}" y2="{yb}" stroke="#1f2a36" stroke-width="1"/>
+  <path d="{battery_path}" fill="none" stroke="#4ade80" stroke-width="2"/>"##,
+        w = width,
+        h = height,
+        pad = pad,
+        xr = width - pad,
+        ymid = pad + (height - pad * 2.0) * 0.5,
+        yb = height - pad,
+    );
+
+    if let Some((ref path, _, _)) = range_path {
+        let _ = write!(
+            svg,
+            r##"
+  <path d="{path}" fill="none" stroke="#facc15" stroke-width="1.5" stroke-dasharray="3,2" opacity="0.85"/>"##,
+        );
+    }
+    svg.push_str("\n</svg>\n");
+
+    let range_legend = match range_path {
+        Some((_, lo, hi)) => format!(
+            r#"<span class="range-swatch">range {lo:.0}–{hi:.0} mi</span>"#,
+            lo = lo,
+            hi = hi,
+        ),
+        None => String::new(),
+    };
+
+    format!(
+        r#"{svg}<div class="trend-legend"><span>0%</span><span>SOC {observed_min:.0}–{observed_max:.0}%</span><span>100%</span>{range_legend}</div>"#,
+    )
+}
+
+fn build_path(values: &[f64], min: f64, max: f64, width: f64, height: f64, pad: f64) -> String {
+    let range = (max - min).max(f64::EPSILON);
+    let step = (width - pad * 2.0) / (values.len() as f64 - 1.0).max(1.0);
     let mut path = String::from("M");
-    for (i, value) in samples.iter().enumerate() {
+    for (i, value) in values.iter().enumerate() {
         let x = pad + step * i as f64;
         let y = pad + (height - pad * 2.0) * (1.0 - (value - min) / range);
         if i == 0 {
@@ -345,22 +497,7 @@ fn render_trend_svg(points: &[crate::view_model::TrendPointView]) -> String {
             let _ = write!(path, " L{x:.1},{y:.1}");
         }
     }
-
-    format!(
-        r##"<svg viewBox="0 0 {w} {h}" preserveAspectRatio="none" class="trend">
-  <line x1="{pad}" y1="{pad}" x2="{xr}" y2="{pad}" stroke="#1f2a36" stroke-width="1"/>
-  <line x1="{pad}" y1="{ymid:.1}" x2="{xr}" y2="{ymid:.1}" stroke="#1f2a36" stroke-width="1" stroke-dasharray="2,3"/>
-  <line x1="{pad}" y1="{yb}" x2="{xr}" y2="{yb}" stroke="#1f2a36" stroke-width="1"/>
-  <path d="{path}" fill="none" stroke="#4ade80" stroke-width="2"/>
-</svg>
-<div class="trend-legend"><span>0%</span><span>observed {observed_min:.0}–{observed_max:.0}%</span><span>100%</span></div>"##,
-        w = width,
-        h = height,
-        pad = pad,
-        xr = width - pad,
-        ymid = pad + (height - pad * 2.0) * 0.5,
-        yb = height - pad,
-    )
+    path
 }
 
 fn escape(s: &str) -> String {
@@ -444,8 +581,9 @@ const HTML_HEAD: &str = r#"<!DOCTYPE html>
   .badge.idle { background: #1f2a36; color: var(--muted); }
   .muted { color: var(--muted); font-size: 12px; }
   .trend { width: 100%; height: 140px; display: block; }
-  .trend-legend { display: flex; justify-content: space-between; color: var(--muted);
-    font-size: 12px; margin-top: 4px; }
+  .trend-legend { display: flex; justify-content: space-between; gap: 12px; color: var(--muted);
+    font-size: 12px; margin-top: 4px; flex-wrap: wrap; }
+  .trend-legend .range-swatch { color: var(--warn); }
 </style>
 </head>
 <body>
