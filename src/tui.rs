@@ -897,10 +897,7 @@ fn draw_charge_insights(
                     }
                 })
                 .unwrap_or_else(|| "—".into());
-            let charger = live
-                .charger_id
-                .clone()
-                .unwrap_or_else(|| "unknown".into());
+            let charger = live.charger_id.clone().unwrap_or_else(|| "unknown".into());
 
             vec![
                 kv(W, "Power", &power, Color::Green),

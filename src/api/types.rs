@@ -224,9 +224,7 @@ impl LiveChargingSession {
 
     /// Total energy delivered this session, in kWh.
     pub fn total_energy_kwh(&self) -> Option<f64> {
-        self.total_charged_energy
-            .as_ref()
-            .and_then(|v| v.as_f64())
+        self.total_charged_energy.as_ref().and_then(|v| v.as_f64())
     }
 
     /// Range added this session, in km.
@@ -602,11 +600,8 @@ impl VehicleStateFields {
         let toks: Vec<&str> = status.split('_').collect();
         for (i, tok) in toks.iter().enumerate() {
             if *tok == "charging" {
-                let preceded_by_not = i
-                    .checked_sub(1)
-                    .and_then(|j| toks.get(j))
-                    .copied()
-                    == Some("not");
+                let preceded_by_not =
+                    i.checked_sub(1).and_then(|j| toks.get(j)).copied() == Some("not");
                 if !preceded_by_not {
                     return true;
                 }

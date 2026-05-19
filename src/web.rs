@@ -237,11 +237,7 @@ fn render_html(view: &DashboardView) -> String {
             date = escape(&sw.available_version_date),
         );
     }
-    let _ = write!(
-        sw_rows,
-        "<dt>Status</dt><dd>{}</dd>",
-        escape(&sw.status)
-    );
+    let _ = write!(sw_rows, "<dt>Status</dt><dd>{}</dd>", escape(&sw.status));
     let _ = write!(
         sw_rows,
         "<dt>Install type</dt><dd>{}</dd>",

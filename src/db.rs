@@ -497,11 +497,15 @@ impl Db {
         // strftime modifier list.
         let sql = format!(
             "SELECT battery_level, distance_to_empty_km, vehicle_mileage_m, speed
-             FROM vehicle_state
-             WHERE vehicle_id = ?1
-               AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{hours} hours')
-             ORDER BY id ASC
-             LIMIT ?2"
+             FROM (
+                 SELECT id, battery_level, distance_to_empty_km, vehicle_mileage_m, speed
+                 FROM vehicle_state
+                 WHERE vehicle_id = ?1
+                   AND ts >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-{hours} hours')
+                 ORDER BY id DESC
+                 LIMIT ?2
+             )
+             ORDER BY id ASC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
 
@@ -596,36 +600,51 @@ impl Db {
     /// the mi/kWh ratios; cancelled or sub-minute sessions otherwise produce
     /// junk efficiency numbers.
     pub fn charging_session_stats(&self, vehicle_id: &str) -> Result<Option<ChargingStats>> {
+        let vehicle_specific_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM charging_sessions WHERE vehicle_id = ?1",
+            [vehicle_id],
+            |r| r.get(0),
+        )?;
+        let vehicle_filter = if vehicle_specific_count > 0 {
+            "vehicle_id = ?1"
+        } else {
+            "vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = ''"
+        };
+
         // 1. totals across the whole history
-        let (count, total_energy, total_range): (i64, f64, f64) = self.conn.query_row(
+        let totals_sql = format!(
             "SELECT
                 COUNT(*),
                 COALESCE(SUM(total_energy_kwh), 0),
                 COALESCE(SUM(range_added_km), 0)
              FROM charging_sessions
-             WHERE vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = ''",
-            [vehicle_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
+             WHERE {vehicle_filter}"
+        );
+        let (count, total_energy, total_range): (i64, f64, f64) =
+            self.conn.query_row(&totals_sql, [vehicle_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
 
         if count == 0 {
             return Ok(None);
         }
 
         // 2. mi/kWh aggregates filtered to realistic sessions
-        let efficiency_sql = "SELECT
+        let efficiency_sql = format!(
+            "SELECT
                 AVG(range_km / 1.60934 / energy_kwh),
                 MAX(range_km / 1.60934 / energy_kwh),
                 MIN(range_km / 1.60934 / energy_kwh)
              FROM (
                 SELECT total_energy_kwh AS energy_kwh, range_added_km AS range_km
                 FROM charging_sessions
-                WHERE (vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = '')
+                WHERE ({vehicle_filter})
                   AND total_energy_kwh > 0.5
                   AND range_added_km > 0.5
-             )";
+             )"
+        );
         let (avg_eff, best_eff, worst_eff): (Option<f64>, Option<f64>, Option<f64>) =
-            self.conn.query_row(efficiency_sql, [vehicle_id], |r| {
+            self.conn.query_row(&efficiency_sql, [vehicle_id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?;
 
@@ -643,7 +662,7 @@ impl Db {
                               THEN range_added_km / 1.60934 / total_energy_kwh
                               ELSE NULL END)
                  FROM charging_sessions
-                 WHERE (vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = '')
+                 WHERE ({vehicle_filter})
                    AND ({where_clause})"
             );
             let row: (i64, Option<f64>) = self
@@ -787,6 +806,27 @@ mod tests {
         assert_eq!(trend.len(), 3);
         assert_eq!(trend.first().and_then(|p| p.battery_level), Some(75.0));
         assert_eq!(trend.last().and_then(|p| p.battery_level), Some(73.5));
+    }
+
+    #[test]
+    fn recent_vehicle_trend_keeps_latest_samples_when_over_cap() {
+        let db = make_test_db();
+
+        for idx in 0..2005 {
+            let json = format!(
+                r#"{{
+                    "batteryLevel": {{ "value": {idx} }},
+                    "distanceToEmpty": {{ "value": 320 }}
+                }}"#
+            );
+            let vs: VehicleStateFields = serde_json::from_str(&json).unwrap();
+            db.insert_state("VIN123", &vs).unwrap();
+        }
+
+        let trend = db.recent_vehicle_trend("VIN123", 24).unwrap();
+        assert_eq!(trend.len(), 2000);
+        assert_eq!(trend.first().and_then(|p| p.battery_level), Some(5.0));
+        assert_eq!(trend.last().and_then(|p| p.battery_level), Some(2004.0));
     }
 
     #[test]
@@ -945,6 +985,38 @@ mod tests {
     fn charging_session_stats_returns_none_when_empty() {
         let db = make_test_db();
         assert!(db.charging_session_stats("VIN-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn charging_session_stats_prefers_vehicle_specific_rows_over_legacy_blanks() {
+        let db = make_test_db();
+
+        let sessions = vec![
+            ChargingSession {
+                transaction_id: Some("vin-1".into()),
+                vehicle_id: Some("VIN-1".into()),
+                total_energy_kwh: Some(10.0),
+                range_added_km: Some(32.0),
+                ..test_charging_session()
+            },
+            ChargingSession {
+                transaction_id: Some("legacy".into()),
+                vehicle_id: None,
+                total_energy_kwh: Some(90.0),
+                range_added_km: Some(900.0),
+                ..test_charging_session()
+            },
+        ];
+        db.upsert_charging_sessions(&sessions).unwrap();
+
+        let stats = db.charging_session_stats("VIN-1").unwrap().unwrap();
+        assert_eq!(stats.session_count, 1);
+        assert!((stats.total_energy_kwh - 10.0).abs() < 0.01);
+        assert!((stats.total_range_km - 32.0).abs() < 0.01);
+
+        let legacy_stats = db.charging_session_stats("VIN-2").unwrap().unwrap();
+        assert_eq!(legacy_stats.session_count, 1);
+        assert!((legacy_stats.total_energy_kwh - 90.0).abs() < 0.01);
     }
 
     fn test_charging_session() -> ChargingSession {

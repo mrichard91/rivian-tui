@@ -282,10 +282,7 @@ impl VehicleView {
             &vs.closure_liftgate_closed,
             &vs.closure_tailgate_closed,
         ];
-        let all_closed = if closures
-            .iter()
-            .all(|f| vs.get_boolish(f).unwrap_or(true))
-        {
+        let all_closed = if closures.iter().all(|f| vs.get_boolish(f).unwrap_or(true)) {
             "all closed"
         } else {
             "open"
@@ -311,7 +308,10 @@ impl VehicleView {
 
 impl SoftwareView {
     fn from_state(vs: &VehicleStateFields) -> Self {
-        fn display(vs: &VehicleStateFields, field: &Option<crate::api::types::StateValue>) -> String {
+        fn display(
+            vs: &VehicleStateFields,
+            field: &Option<crate::api::types::StateValue>,
+        ) -> String {
             let s = vs.get_str(field);
             if s == "unknown" || s.is_empty() {
                 "—".into()
@@ -352,12 +352,8 @@ impl SoftwareView {
             "—".into()
         };
 
-        let downloading = vs
-            .get_f64(&vs.ota_download_progress)
-            .filter(|v| *v > 0.0);
-        let installing = vs
-            .get_f64(&vs.ota_install_progress)
-            .filter(|v| *v > 0.0);
+        let downloading = vs.get_f64(&vs.ota_download_progress).filter(|v| *v > 0.0);
+        let installing = vs.get_f64(&vs.ota_install_progress).filter(|v| *v > 0.0);
 
         let download_progress = downloading
             .map(|v| format!("{v:.0}%"))
@@ -547,7 +543,11 @@ impl From<&LiveChargingSession> for LiveChargeView {
             .vehicle_charger_state_str()
             .map(|s| s.replace('_', " "))
             .unwrap_or_else(dash);
-        let started = s.start_time.as_deref().map(humanize_iso).unwrap_or_else(dash);
+        let started = s
+            .start_time
+            .as_deref()
+            .map(humanize_iso)
+            .unwrap_or_else(dash);
 
         Self {
             power_kw,
@@ -574,7 +574,11 @@ impl From<&ChargingStats> for ChargingStatsView {
             format!(
                 "{} session{} · {}",
                 stats.home_session_count,
-                if stats.home_session_count == 1 { "" } else { "s" },
+                if stats.home_session_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 fmt_eff(stats.home_avg_mi_per_kwh),
             )
         } else {
@@ -584,7 +588,11 @@ impl From<&ChargingStats> for ChargingStatsView {
             format!(
                 "{} session{} · {}",
                 stats.public_session_count,
-                if stats.public_session_count == 1 { "" } else { "s" },
+                if stats.public_session_count == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 fmt_eff(stats.public_avg_mi_per_kwh),
             )
         } else {
@@ -609,7 +617,11 @@ fn format_last_update(ts: Option<DateTime<Utc>>) -> String {
         return "never".to_string();
     };
     let local: DateTime<Local> = ts.into();
-    format!("{} ({})", local.format("%Y-%m-%d %H:%M:%S"), relative_age(ts))
+    format!(
+        "{} ({})",
+        local.format("%Y-%m-%d %H:%M:%S"),
+        relative_age(ts)
+    )
 }
 
 fn relative_age(ts: DateTime<Utc>) -> String {

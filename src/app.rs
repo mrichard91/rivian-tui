@@ -570,6 +570,20 @@ impl App {
                 }
                 AppEvent::LiveChargingSession { session, .. } => {
                     let live = session.map(|boxed| *boxed);
+                    if live.is_some()
+                        && self
+                            .vehicle_state
+                            .as_ref()
+                            .is_some_and(|state| !state.is_actively_charging())
+                    {
+                        // A live-session request can complete after a newer
+                        // vehicle-state poll has already observed charging
+                        // stopped. Do not let that stale response resurrect
+                        // the in-progress card.
+                        self.live_charging_session = None;
+                        self.sync_shared_data();
+                        continue;
+                    }
                     let vehicle_id = self
                         .tokens
                         .as_ref()
@@ -594,10 +608,7 @@ impl App {
                             .soc_percent()
                             .map(|s| format!("{s:.0}%"))
                             .unwrap_or_else(|| "?".into());
-                        self.log(
-                            LogLevel::Info,
-                            &format!("Live charging: {power} @ {soc}"),
-                        );
+                        self.log(LogLevel::Info, &format!("Live charging: {power} @ {soc}"));
                     }
 
                     self.live_charging_session = live;
@@ -1156,5 +1167,35 @@ mod tests {
         // pin the view to the bottom.
         app.log(LogLevel::Info, "tail entry");
         assert_eq!(app.log_selected, app.activity_log.len() - 1);
+    }
+
+    #[test]
+    fn stale_live_session_event_does_not_resurrect_finished_charge() {
+        let mut app = App::new(true, None);
+        app.vehicle_state = Some(VehicleStateFields {
+            charger_state: Some(StateValue {
+                value: serde_json::json!("charging_inactive"),
+            }),
+            ..Default::default()
+        });
+
+        app.event_tx
+            .send(AppEvent::LiveChargingSession {
+                generation: app.generation,
+                session: Some(Box::new(LiveChargingSession {
+                    power: Some(TsValue {
+                        value: serde_json::json!(32.0),
+                        updated_at: None,
+                    }),
+                    ..Default::default()
+                })),
+            })
+            .unwrap();
+
+        app.drain_events();
+
+        assert!(app.live_charging_session.is_none());
+        let shared = app.shared_data.read().unwrap();
+        assert!(shared.live_charging_session.is_none());
     }
 }
