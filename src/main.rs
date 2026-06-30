@@ -36,8 +36,8 @@ struct Cli {
     #[arg(long, short)]
     debug: bool,
 
-    /// Poll interval in seconds
-    #[arg(long, default_value = "300")]
+    /// Poll interval in seconds (minimum 30s to avoid hammering the API)
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(30..))]
     poll_interval: u64,
 
     /// Dump raw vehicle state JSON to stdout and exit (no TUI)
@@ -74,6 +74,16 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Any panic past this point would otherwise leave the terminal in raw
+    // mode + alternate screen with the panic message invisible. Restore the
+    // terminal before the default hook prints.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        default_panic_hook(info);
+    }));
 
     // Terminal setup
     enable_raw_mode()?;
@@ -149,14 +159,13 @@ async fn run_tui(
     config: AppConfig,
     web_listener: Option<(tokio::net::TcpListener, std::net::SocketAddr)>,
 ) -> Result<()> {
-    let mqtt = config
-        .enabled_mqtt()
-        .cloned()
-        .map(MqttPublisher::start)
-        .transpose()?;
-    let mut app = App::new(cli.debug, mqtt);
+    // Build the app first so MQTT can use its event channel to surface
+    // broker/publish errors as activity-log entries.
+    let mut app = App::new(cli.debug, None);
 
     if let Some(mqtt_config) = config.enabled_mqtt() {
+        let mqtt = MqttPublisher::start(mqtt_config.clone(), app.event_tx.clone())?;
+        app.mqtt = Some(mqtt);
         app.log(
             LogLevel::Info,
             &format!("MQTT publishing enabled: {}", mqtt_config.broker_label()),
@@ -168,12 +177,16 @@ async fn run_tui(
     // reported.
     if let Some((listener, addr)) = web_listener {
         let shared = app.shared_data_handle();
+        // Cap the browser refresh at 60s regardless of the vehicle-state poll
+        // interval: live-charging data updates every 60s, and a page that
+        // reloads every 5 minutes would render that cadence invisible.
+        let refresh_interval = cli.poll_interval.min(60);
         app.log(
             LogLevel::Info,
             &format!("Web dashboard listening on http://{addr}/"),
         );
         tokio::spawn(async move {
-            if let Err(e) = web::serve(listener, shared).await {
+            if let Err(e) = web::serve(listener, shared, refresh_interval).await {
                 eprintln!("web server error: {e}");
             }
         });
@@ -219,6 +232,25 @@ async fn run_tui(
         {
             app.poll_vehicle_state();
             last_poll = Instant::now();
+        }
+
+        // While the vehicle is actively charging, poll the live-session
+        // endpoint on a faster cadence than the full vehicle-state fetch so
+        // kW / SOC / energy delivered update at a reasonable rate. The
+        // vehicle-state poll alone can be 5+ minutes apart, which is too
+        // slow to feel "live".
+        const LIVE_POLL_INTERVAL_SECS: u64 = 60;
+        let live_charging = app
+            .vehicle_state
+            .as_ref()
+            .map(|vs| vs.is_actively_charging())
+            .unwrap_or(false);
+        let live_due = app
+            .last_live_fetch
+            .map(|t| t.elapsed().as_secs() >= LIVE_POLL_INTERVAL_SECS)
+            .unwrap_or(true);
+        if app.mode == Mode::Dashboard && app.tokens.is_some() && live_charging && live_due {
+            app.fetch_live_session();
         }
 
         // Handle input

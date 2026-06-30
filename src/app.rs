@@ -1,4 +1,5 @@
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
@@ -8,7 +9,7 @@ use crate::api::auth::{authenticated_headers, AuthManager, LoginOutcome, Pending
 use crate::api::client::{RequestLog, RivianClient, API_URL, CHARGING_URL};
 use crate::api::queries;
 use crate::api::types::*;
-use crate::db::{ChargeSessionSummary, ChargingStats, Db, VehicleTrendPoint};
+use crate::db::{ChargeSessionSummary, ChargingStats, Db, Trip, VehicleTrendPoint};
 use crate::mqtt::MqttPublisher;
 
 /// Cap on retained activity log entries. The oldest entries are dropped once
@@ -22,6 +23,7 @@ pub const MAX_LOG_ENTRIES: usize = 500;
 pub struct DashboardData {
     pub vehicle_state: Option<VehicleStateFields>,
     pub recent_trend: Vec<VehicleTrendPoint>,
+    pub recent_trips: Vec<Trip>,
     pub last_charge_session: Option<ChargeSessionSummary>,
     pub live_charging_session: Option<LiveChargingSession>,
     pub charging_stats: Option<ChargingStats>,
@@ -66,6 +68,10 @@ pub struct LogEntry {
 
 /// Events sent from background tasks to the main loop
 pub enum AppEvent {
+    /// Log message produced by a long-lived service (e.g. MQTT). Bypasses
+    /// the generation filter because it isn't tied to a specific
+    /// auth/session lifecycle.
+    ServiceLog(LogEntry),
     VehicleState {
         generation: u64,
         state: Box<VehicleStateFields>,
@@ -105,8 +111,11 @@ pub enum AppEvent {
 }
 
 impl AppEvent {
-    fn generation(&self) -> u64 {
+    /// Generation associated with the event, if any. Service-level events
+    /// (e.g. MQTT) have no generation and are processed unconditionally.
+    fn maybe_generation(&self) -> Option<u64> {
         match self {
+            Self::ServiceLog(_) => None,
             Self::VehicleState { generation, .. }
             | Self::AuthSuccess { generation, .. }
             | Self::MfaRequired { generation, .. }
@@ -115,7 +124,7 @@ impl AppEvent {
             | Self::Log { generation, .. }
             | Self::RequestLog { generation, .. }
             | Self::ChargingSessions { generation, .. }
-            | Self::LiveChargingSession { generation, .. } => *generation,
+            | Self::LiveChargingSession { generation, .. } => Some(*generation),
         }
     }
 }
@@ -142,6 +151,7 @@ pub struct App {
     // Vehicle data
     pub vehicle_state: Option<VehicleStateFields>,
     pub recent_trend: Vec<VehicleTrendPoint>,
+    pub recent_trips: Vec<Trip>,
     pub last_charge_session: Option<ChargeSessionSummary>,
     pub live_charging_session: Option<LiveChargingSession>,
     pub charging_stats: Option<ChargingStats>,
@@ -160,6 +170,17 @@ pub struct App {
     pub mqtt: Option<MqttPublisher>,
     pub db_snapshot_count: i64,
     pub generation: u64,
+
+    /// Shared reqwest client (and its connection pool) reused across every
+    /// spawned request. Cloning it is cheap — internally Arc — so each
+    /// per-task `RivianClient` reuses the same pool instead of building a
+    /// fresh one.
+    http_client: reqwest::Client,
+
+    /// When the last `fetch_live_session` fired. Lets the main loop poll
+    /// the charging endpoint on a faster cadence than the full vehicle-state
+    /// query while a session is active.
+    pub last_live_fetch: Option<Instant>,
 
     // Channel for receiving background events
     pub event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -192,6 +213,7 @@ impl App {
 
             vehicle_state: None,
             recent_trend: Vec::new(),
+            recent_trips: Vec::new(),
             last_charge_session: None,
             live_charging_session: None,
             charging_stats: None,
@@ -209,6 +231,11 @@ impl App {
             db_snapshot_count: 0,
             generation: 0,
 
+            http_client: RivianClient::build_http()
+                .expect("reqwest client builder uses static config; should not fail"),
+
+            last_live_fetch: None,
+
             event_tx,
             event_rx,
             shared_data: Arc::new(RwLock::new(DashboardData::default())),
@@ -221,6 +248,7 @@ impl App {
         let snapshot = DashboardData {
             vehicle_state: self.vehicle_state.clone(),
             recent_trend: self.recent_trend.clone(),
+            recent_trips: self.recent_trips.clone(),
             last_charge_session: self.last_charge_session.clone(),
             live_charging_session: self.live_charging_session.clone(),
             charging_stats: self.charging_stats.clone(),
@@ -238,16 +266,20 @@ impl App {
         Arc::clone(&self.shared_data)
     }
 
-    /// Build a RivianClient wired to our event channel
+    /// Build a RivianClient wired to our event channel. Reuses the shared
+    /// reqwest connection pool so we don't spin up a fresh one per task.
     fn make_client(
+        http: reqwest::Client,
         debug: bool,
         event_tx: &mpsc::UnboundedSender<AppEvent>,
         generation: u64,
-    ) -> Result<RivianClient, anyhow::Error> {
+    ) -> RivianClient {
         let (log_tx, mut log_rx) = mpsc::unbounded_channel::<RequestLog>();
         let app_tx = event_tx.clone();
 
-        // Forward request logs to app events
+        // Forward request logs to app events. The forwarder captures the
+        // generation at spawn time so a logout/login between the request
+        // firing and the response arriving doesn't apply stale data.
         tokio::spawn(async move {
             while let Some(req_log) = log_rx.recv().await {
                 let _ = app_tx.send(AppEvent::RequestLog {
@@ -257,7 +289,9 @@ impl App {
             }
         });
 
-        RivianClient::new().map(|c| c.with_debug(debug).with_logger(log_tx))
+        RivianClient::from_http(http)
+            .with_debug(debug)
+            .with_logger(log_tx)
     }
 
     fn focus_last_log(&mut self) {
@@ -327,6 +361,7 @@ impl App {
     fn refresh_dashboard_insights(&mut self) {
         let Some(vehicle_id) = self.tokens.as_ref().map(|tokens| tokens.vehicle_id.clone()) else {
             self.recent_trend.clear();
+            self.recent_trips.clear();
             self.last_charge_session = None;
             self.charging_stats = None;
             self.sync_shared_data();
@@ -334,6 +369,7 @@ impl App {
         };
         let Some(db) = &self.db else {
             self.recent_trend.clear();
+            self.recent_trips.clear();
             self.last_charge_session = None;
             self.charging_stats = None;
             self.sync_shared_data();
@@ -341,6 +377,7 @@ impl App {
         };
 
         let trend_result = db.recent_vehicle_trend(&vehicle_id, 24); // last 24 hours
+        let trips_result = db.recent_trips(&vehicle_id, 5); // last 5 driving trips
         let charge_result = db.latest_charging_session(&vehicle_id);
         let stats_result = db.charging_session_stats(&vehicle_id);
 
@@ -350,6 +387,15 @@ impl App {
             }
             Err(e) => {
                 self.log(LogLevel::Error, &format!("Trend load failed: {e}"));
+            }
+        }
+
+        match trips_result {
+            Ok(trips) => {
+                self.recent_trips = trips;
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, &format!("Trip load failed: {e}"));
             }
         }
 
@@ -418,11 +464,21 @@ impl App {
     /// Drain all pending events from background tasks
     pub fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
-            if event.generation() != self.generation {
-                continue;
+            if let Some(gen) = event.maybe_generation() {
+                if gen != self.generation {
+                    continue;
+                }
             }
 
             match event {
+                AppEvent::ServiceLog(entry) => {
+                    let was_tailing = self.log_is_tailing();
+                    self.activity_log.push(entry);
+                    self.trim_activity_log();
+                    if was_tailing {
+                        self.focus_last_log();
+                    }
+                }
                 AppEvent::VehicleState { state, .. } => {
                     let vehicle_id = self
                         .tokens
@@ -615,8 +671,13 @@ impl App {
                     self.sync_shared_data();
                 }
                 AppEvent::ChargingSessions { sessions, .. } => {
+                    let default_vehicle_id = self
+                        .tokens
+                        .as_ref()
+                        .map(|t| t.vehicle_id.clone())
+                        .unwrap_or_default();
                     let new_sessions = if let Some(db) = &self.db {
-                        match db.upsert_charging_sessions(&sessions) {
+                        match db.upsert_charging_sessions(&sessions, &default_vehicle_id) {
                             Ok(new_sessions) => {
                                 let total = db.charging_session_count().unwrap_or(0);
                                 self.log(
@@ -679,20 +740,12 @@ impl App {
         let email = self.login_email.clone();
         let password = self.login_password.clone();
         let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx, generation) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: e.to_string(),
-                    });
-                    return;
-                }
-            };
+            let client = Self::make_client(http, debug, &tx, generation);
             let auth_mgr = AuthManager::new(client);
 
             let _ = tx.send(AppEvent::Log {
@@ -742,20 +795,12 @@ impl App {
 
         let otp = self.login_otp.clone();
         let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx, generation) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: e.to_string(),
-                    });
-                    return;
-                }
-            };
+            let client = Self::make_client(http, debug, &tx, generation);
             let auth_mgr = AuthManager::new(client);
 
             match auth_mgr.complete_mfa(&mfa, &otp).await {
@@ -792,21 +837,13 @@ impl App {
         let vehicle_id = tokens.vehicle_id.clone();
         let headers = authenticated_headers(tokens);
         let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
         self.log(LogLevel::Info, "Fetching vehicle state...");
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx, generation) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: e.to_string(),
-                    });
-                    return;
-                }
-            };
+            let client = Self::make_client(http, debug, &tx, generation);
 
             let vars = serde_json::json!({ "vehicleID": vehicle_id });
 
@@ -856,20 +893,13 @@ impl App {
         let vehicle_id = tokens.vehicle_id.clone();
         let headers = authenticated_headers(tokens);
         let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
+        self.last_live_fetch = Some(Instant::now());
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx, generation) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Live session fetch failed: {e}"),
-                    });
-                    return;
-                }
-            };
+            let client = Self::make_client(http, debug, &tx, generation);
 
             let vars = serde_json::json!({ "vehicleId": vehicle_id });
             let result: Result<LiveSessionData, _> = client
@@ -906,21 +936,13 @@ impl App {
         };
         let headers = authenticated_headers(tokens);
         let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
         self.log(LogLevel::Info, "Fetching charging history...");
 
         tokio::spawn(async move {
-            let client = match Self::make_client(debug, &tx, generation) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Charging fetch failed: {e}"),
-                    });
-                    return;
-                }
-            };
+            let client = Self::make_client(http, debug, &tx, generation);
 
             let result: Result<ChargingSessionsData, _> = client
                 .graphql(
@@ -1021,6 +1043,7 @@ impl App {
         self.tokens = None;
         self.vehicle_state = None;
         self.recent_trend.clear();
+        self.recent_trips.clear();
         self.last_charge_session = None;
         self.live_charging_session = None;
         self.charging_stats = None;
@@ -1098,6 +1121,7 @@ mod tests {
             csrf_token: "csrf".into(),
             app_session_token: "ast".into(),
             vehicle_id: "vehicle".into(),
+            device_id: Some("device".into()),
         }
     }
 

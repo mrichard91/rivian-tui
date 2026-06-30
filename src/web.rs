@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 
 use crate::app::{DashboardData, SharedDashboardData};
 use crate::config::WebConfig;
-use crate::view_model::DashboardView;
+use crate::view_model::{AlertKind, DashboardView};
 
 /// Bind a TcpListener and return it alongside the resolved address. Bind
 /// happens before `serve()` so the caller can log the address (or surface a
@@ -30,13 +30,30 @@ pub async fn bind(config: &WebConfig) -> Result<(TcpListener, std::net::SocketAd
     Ok((listener, local))
 }
 
-/// Serve the dashboard over the provided listener forever.
-pub async fn serve(listener: TcpListener, data: SharedDashboardData) -> Result<()> {
+/// Shared state passed to the axum router.
+#[derive(Clone)]
+struct WebState {
+    data: SharedDashboardData,
+    refresh_interval_secs: u64,
+}
+
+/// Serve the dashboard over the provided listener forever. `refresh_interval_secs`
+/// is used for the HTML meta-refresh tag so the browser polls at roughly the
+/// same cadence as the TUI's vehicle-state fetch.
+pub async fn serve(
+    listener: TcpListener,
+    data: SharedDashboardData,
+    refresh_interval_secs: u64,
+) -> Result<()> {
+    let state = WebState {
+        data,
+        refresh_interval_secs,
+    };
     let app = Router::new()
         .route("/", get(dashboard_html))
         .route("/api/state", get(dashboard_json))
         .route("/healthz", get(healthz))
-        .with_state(data);
+        .with_state(state);
 
     axum::serve(listener, app)
         .await
@@ -47,17 +64,17 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn dashboard_json(State(data): State<SharedDashboardData>) -> Response {
-    match current_view(&data) {
+async fn dashboard_json(State(state): State<WebState>) -> Response {
+    match current_view(&state.data) {
         Ok(view) => Json(view).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
-async fn dashboard_html(State(data): State<SharedDashboardData>) -> Response {
-    match current_view(&data) {
+async fn dashboard_html(State(state): State<WebState>) -> Response {
+    match current_view(&state.data) {
         Ok(view) => {
-            let body = render_html(&view);
+            let body = render_html(&view, state.refresh_interval_secs);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -77,11 +94,16 @@ fn current_view(data: &SharedDashboardData) -> Result<DashboardView, String> {
     Ok(DashboardView::from_data(&snapshot))
 }
 
-fn render_html(view: &DashboardView) -> String {
+fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
     let mut body = String::with_capacity(8 * 1024);
 
     // Header
-    body.push_str(HTML_HEAD);
+    body.push_str(HTML_HEAD_OPEN);
+    let _ = writeln!(
+        body,
+        "<meta http-equiv=\"refresh\" content=\"{refresh_interval_secs}\">"
+    );
+    body.push_str(HTML_HEAD_REST);
 
     let vehicle_id = view
         .vehicle_id
@@ -109,6 +131,51 @@ fn render_html(view: &DashboardView) -> String {
         );
         body.push_str(HTML_TAIL);
         return body;
+    }
+
+    // Prominent update banner, mirroring the TUI's alert strip, so a pending
+    // OTA is visible above the fold rather than buried in the Software card.
+    if view.software.update_available {
+        let suffix = if view.software.is_installing {
+            format!(" · {}", view.software.progress_summary)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            body,
+            r#"<div class="alert-banner">⬆ Software update available — <strong>{version}</strong> <span class="muted">{date}</span>{suffix}</div>"#,
+            version = escape(&view.software.available_version),
+            date = escape(&view.software.available_version_date),
+            suffix = escape(&suffix),
+        );
+    }
+
+    // Vehicle alerts (doors, windows, tires, modes…) — the same set the TUI
+    // alert strip shows, minus the OTA entry covered by the banner above.
+    // When the cloud sync is stale these describe state from a while ago, so
+    // lead with the data age instead of presenting them as live.
+    let vehicle_alerts: Vec<_> = view
+        .alerts
+        .items
+        .iter()
+        .filter(|a| a.kind != AlertKind::Ota)
+        .collect();
+    if !vehicle_alerts.is_empty() {
+        let age = view
+            .alerts
+            .data_age
+            .as_deref()
+            .map(|age| format!(r#" <span class="muted">as of {}</span>"#, escape(age)))
+            .unwrap_or_default();
+        let messages = vehicle_alerts
+            .iter()
+            .map(|a| escape(&a.message))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let _ = writeln!(
+            body,
+            r#"<div class="alert-banner critical">⚠ {messages}{age}</div>"#,
+        );
     }
 
     body.push_str("<main class=\"grid\">");
@@ -229,6 +296,14 @@ fn render_html(view: &DashboardView) -> String {
     };
 
     let mut sw_rows = String::new();
+    // Render a row only when the value carries information (skip dash/empty
+    // sentinels) so the card doesn't fill with placeholder rows.
+    let optional_row = |rows: &mut String, label: &str, val: &str| {
+        if val != "—" && !val.is_empty() {
+            let _ = write!(rows, "<dt>{label}</dt><dd>{}</dd>", escape(val));
+        }
+    };
+
     if sw.update_available {
         let _ = write!(
             sw_rows,
@@ -238,41 +313,25 @@ fn render_html(view: &DashboardView) -> String {
         );
     }
     let _ = write!(sw_rows, "<dt>Status</dt><dd>{}</dd>", escape(&sw.status));
-    let _ = write!(
-        sw_rows,
-        "<dt>Install type</dt><dd>{}</dd>",
-        escape(&sw.install_type)
-    );
+    optional_row(&mut sw_rows, "Install type", &sw.install_type);
     let _ = write!(
         sw_rows,
         "<dt>Progress</dt><dd>{}</dd>",
         escape(&sw.progress_summary)
     );
 
-    // Only surface the install-detail rows when there's actually a pending
-    // install — otherwise they're all placeholders.
-    let installing = sw.install_progress != "—" || sw.install_ready != "—";
-    if installing {
-        let _ = write!(
-            sw_rows,
-            "<dt>Install ready</dt><dd>{}</dd>",
-            escape(&sw.install_ready)
-        );
-        let _ = write!(
-            sw_rows,
-            "<dt>Download</dt><dd>{}</dd>",
-            escape(&sw.download_progress)
-        );
-        let _ = write!(
-            sw_rows,
-            "<dt>Install</dt><dd>{}</dd>",
-            escape(&sw.install_progress)
-        );
-        let _ = write!(
-            sw_rows,
-            "<dt>Duration</dt><dd>{}</dd>",
-            escape(&sw.install_duration)
-        );
+    // Surface readiness + scheduled install time whenever an update is
+    // pending, actively progressing, or staged awaiting its install window —
+    // a staged install with no progress and a sentinel "available version"
+    // is exactly the state a remote viewer most wants to see.
+    if sw.update_available || sw.is_installing || sw.is_install_staged {
+        optional_row(&mut sw_rows, "Install ready", &sw.install_ready);
+        optional_row(&mut sw_rows, "Scheduled", &sw.install_time);
+    }
+    if sw.is_installing {
+        optional_row(&mut sw_rows, "Download", &sw.download_progress);
+        optional_row(&mut sw_rows, "Install", &sw.install_progress);
+        optional_row(&mut sw_rows, "Duration", &sw.install_duration);
     }
 
     let _ = write!(
@@ -395,6 +454,33 @@ fn render_html(view: &DashboardView) -> String {
         );
     }
 
+    // Recent trips card — derived from snapshot history.
+    if !view.trips.is_empty() {
+        let mut rows = String::new();
+        for trip in &view.trips {
+            let _ = write!(
+                rows,
+                "<tr><td>{when}</td><td>{dist}</td><td>{soc}</td><td>{energy}</td><td>{eff}</td></tr>",
+                when = escape(&trip.when),
+                dist = escape(&trip.distance),
+                soc = escape(&trip.soc_delta),
+                energy = escape(&trip.energy),
+                eff = escape(&trip.efficiency),
+            );
+        }
+        let _ = write!(
+            body,
+            r#"<section class="card wide">
+  <h2>Recent trips</h2>
+  <table class="trips">
+    <thead><tr><th>When</th><th>Distance</th><th>SOC</th><th>Energy</th><th>mi/kWh</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</section>
+"#,
+        );
+    }
+
     // Trend card
     if !view.trend.is_empty() {
         body.push_str(r#"<section class="card wide"><h2>24h trend</h2>"#);
@@ -511,13 +597,14 @@ fn escape(s: &str) -> String {
     out
 }
 
-const HTML_HEAD: &str = r#"<!DOCTYPE html>
+const HTML_HEAD_OPEN: &str = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
-<title>rivian-tui dashboard</title>
+"#;
+
+const HTML_HEAD_REST: &str = r#"<title>rivian-tui dashboard</title>
 <style>
   :root {
     --bg: #0b0f14;
@@ -580,6 +667,20 @@ const HTML_HEAD: &str = r#"<!DOCTYPE html>
   .trend-legend { display: flex; justify-content: space-between; gap: 12px; color: var(--muted);
     font-size: 12px; margin-top: 4px; flex-wrap: wrap; }
   .trend-legend .range-swatch { color: var(--warn); }
+  .alert-banner { margin: 12px 12px 0; padding: 12px 16px; border-radius: 10px;
+    background: rgba(250,204,21,0.12); border: 1px solid var(--warn); color: var(--warn);
+    font-size: 14px; font-weight: 600; }
+  .alert-banner strong { font-family: ui-monospace, SFMono-Regular, monospace; }
+  .alert-banner.critical { background: rgba(248,113,113,0.12); border-color: #f87171;
+    color: #f87171; }
+  table.trips { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.trips th { text-align: right; color: var(--muted); font-weight: 500;
+    font-size: 12px; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+  table.trips th:first-child { text-align: left; }
+  table.trips td { text-align: right; padding: 5px 6px; font-variant-numeric: tabular-nums;
+    border-bottom: 1px solid var(--border); }
+  table.trips td:first-child { text-align: left; color: var(--muted); }
+  table.trips tr:last-child td { border-bottom: none; }
 </style>
 </head>
 <body>
@@ -589,3 +690,97 @@ const HTML_TAIL: &str = r#"
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::types::VehicleStateFields;
+    use crate::db::Trip;
+
+    #[test]
+    fn renders_update_banner_and_trips() {
+        let mut data = DashboardData::default();
+        let vs: VehicleStateFields = serde_json::from_str(
+            r#"{
+                "otaCurrentVersion": { "value": "2025.10.0" },
+                "otaAvailableVersion": { "value": "2025.12.1" },
+                "otaAvailableVersionYear": { "value": 2025 },
+                "otaAvailableVersionWeek": { "value": 12 },
+                "otaInstallReady": { "value": "true" },
+                "otaInstallTime": { "value": "tonight" }
+            }"#,
+        )
+        .unwrap();
+        data.vehicle_state = Some(vs);
+        data.recent_trips = vec![Trip {
+            start_ts: Some("2026-06-08T14:00:00Z".into()),
+            end_ts: Some("2026-06-08T15:00:00Z".into()),
+            distance_mi: 12.3,
+            start_soc: Some(80.0),
+            end_soc: Some(74.0),
+            energy_kwh: Some(8.1),
+            efficiency_mi_per_kwh: Some(1.52),
+        }];
+
+        let view = DashboardView::from_data(&data);
+        let html = render_html(&view, 30);
+
+        // Ask #2: prominent OTA banner + richer software detail (ready/scheduled).
+        // (`.alert-banner` is always in the embedded CSS, so match the banner's
+        // rendered text instead.)
+        assert!(
+            html.contains("Software update available"),
+            "update banner missing"
+        );
+        assert!(html.contains("2025.12.1"));
+        assert!(html.contains("Install ready"));
+        assert!(html.contains("Scheduled"));
+
+        // Ask #3: recent trips table with distance + efficiency.
+        assert!(html.contains("Recent trips"));
+        assert!(html.contains("12.3 mi"));
+        assert!(html.contains("1.5 mi/kWh"));
+        assert!(html.contains("80% → 74%"));
+    }
+
+    #[test]
+    fn renders_vehicle_alerts_with_staleness_age() {
+        let mut data = DashboardData::default();
+        let stale_sync = (chrono::Utc::now() - chrono::Duration::minutes(95)).to_rfc3339();
+        let vs: VehicleStateFields = serde_json::from_str(&format!(
+            r#"{{
+                "windowFrontLeftClosed": {{ "value": "open" }},
+                "cloudConnection": {{ "lastSync": "{stale_sync}" }}
+            }}"#,
+        ))
+        .unwrap();
+        data.vehicle_state = Some(vs);
+
+        let view = DashboardView::from_data(&data);
+        let html = render_html(&view, 30);
+
+        assert!(html.contains("Window open"), "vehicle alert missing");
+        assert!(
+            html.contains("as of 1h"),
+            "stale alerts must carry a data age"
+        );
+    }
+
+    #[test]
+    fn no_banner_when_up_to_date() {
+        let mut data = DashboardData::default();
+        let vs: VehicleStateFields = serde_json::from_str(
+            r#"{ "otaCurrentVersion": { "value": "2025.12.1" },
+                 "otaAvailableVersion": { "value": "2025.12.1" } }"#,
+        )
+        .unwrap();
+        data.vehicle_state = Some(vs);
+
+        let view = DashboardView::from_data(&data);
+        let html = render_html(&view, 30);
+        assert!(
+            !html.contains("Software update available"),
+            "banner shown with no update"
+        );
+    }
+}

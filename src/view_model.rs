@@ -7,9 +7,9 @@
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
-use crate::api::types::{LiveChargingSession, VehicleStateFields};
+use crate::api::types::{LiveChargingSession, VehicleStateFields, KM_PER_MI, METERS_PER_MI};
 use crate::app::DashboardData;
-use crate::db::{ChargeSessionSummary, ChargingStats, VehicleTrendPoint};
+use crate::db::{ChargeSessionSummary, ChargingStats, Trip, VehicleTrendPoint};
 
 /// A flat, pre-formatted view of the dashboard intended for HTML/JSON output.
 #[derive(Debug, Clone, Serialize)]
@@ -25,9 +25,184 @@ pub struct DashboardView {
     pub software: SoftwareView,
     pub location: LocationView,
     pub trend: Vec<TrendPointView>,
+    pub trips: Vec<TripView>,
     pub last_charge: Option<ChargeInsightView>,
     pub live_charge: Option<LiveChargeView>,
     pub charging_stats: Option<ChargingStatsView>,
+    pub alerts: AlertsView,
+}
+
+/// What an alert is about — lets renderers special-case categories (e.g. the
+/// web dashboard renders its own richer OTA banner and skips the generic one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertKind {
+    Closure,
+    Window,
+    Tire,
+    ColdLimits,
+    Ota,
+    TwelveVolt,
+    Mode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertView {
+    pub kind: AlertKind,
+    pub severity: AlertSeverity,
+    pub message: String,
+}
+
+/// Alerts derived from the current vehicle state, shared by the TUI strip and
+/// the web banner so the two surfaces can't drift on what counts as an alert.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AlertsView {
+    pub items: Vec<AlertView>,
+    /// Set when the vehicle's cloud sync is stale: every alert value reflects
+    /// state as of this long ago, not "now". The Rivian cloud serves the
+    /// last-synced snapshot while the truck sleeps, so e.g. "window open" can
+    /// persist long after the window was actually closed — renderers must
+    /// qualify the alerts with this age instead of presenting them as live.
+    pub data_age: Option<String>,
+}
+
+impl AlertsView {
+    /// How stale `cloudConnection.lastSync` must be before we qualify alerts
+    /// with an age. Within this window the data is effectively live.
+    const STALE_AFTER_MINS: i64 = 10;
+
+    pub fn from_state(vs: &VehicleStateFields) -> Self {
+        let mut items = Vec::new();
+        let mut push = |kind: AlertKind, severity: AlertSeverity, message: String| {
+            items.push(AlertView {
+                kind,
+                severity,
+                message,
+            });
+        };
+
+        let door_fields = [
+            &vs.door_front_left_closed,
+            &vs.door_front_right_closed,
+            &vs.door_rear_left_closed,
+            &vs.door_rear_right_closed,
+            &vs.closure_frunk_closed,
+            &vs.closure_liftgate_closed,
+        ];
+        if door_fields
+            .iter()
+            .any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open")))
+        {
+            push(
+                AlertKind::Closure,
+                AlertSeverity::Critical,
+                "Door or hatch open".into(),
+            );
+        }
+
+        let window_fields = [
+            &vs.window_front_left_closed,
+            &vs.window_front_right_closed,
+            &vs.window_rear_left_closed,
+            &vs.window_rear_right_closed,
+        ];
+        if window_fields
+            .iter()
+            .any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open")))
+        {
+            push(
+                AlertKind::Window,
+                AlertSeverity::Critical,
+                "Window open".into(),
+            );
+        }
+
+        let tire_fields = [
+            &vs.tire_pressure_status_front_left,
+            &vs.tire_pressure_status_front_right,
+            &vs.tire_pressure_status_rear_left,
+            &vs.tire_pressure_status_rear_right,
+        ];
+        if tire_fields.iter().any(|field| {
+            field
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase().contains("low"))
+                .unwrap_or(false)
+        }) {
+            push(
+                AlertKind::Tire,
+                AlertSeverity::Critical,
+                "Low tire pressure".into(),
+            );
+        }
+
+        if vs.get_f64(&vs.limited_accel_cold).unwrap_or(0.0) > 0.0
+            || vs.get_f64(&vs.limited_regen_cold).unwrap_or(0.0) > 0.0
+        {
+            push(
+                AlertKind::ColdLimits,
+                AlertSeverity::Warning,
+                "Cold-limited accel/regen".into(),
+            );
+        }
+
+        if vs.update_available() {
+            let available = vs.get_str(&vs.ota_available_version);
+            push(
+                AlertKind::Ota,
+                AlertSeverity::Warning,
+                format!("OTA available {available}"),
+            );
+        }
+
+        let battery_12v = vs.get_str(&vs.twelve_volt_battery_health);
+        if battery_12v != "unknown" && battery_12v != "NORMAL_OPERATION" {
+            push(
+                AlertKind::TwelveVolt,
+                AlertSeverity::Warning,
+                format!("12V {battery_12v}"),
+            );
+        }
+
+        for (label, field) in [
+            ("Service mode", &vs.service_mode),
+            ("Car wash mode", &vs.car_wash_mode),
+            ("Pet mode", &vs.pet_mode_status),
+        ] {
+            // Compare case-insensitively: the wire reports e.g. "Off" and
+            // "Disabled" for pet mode, and a case-sensitive list silently
+            // treats "Off" as active — the alert then never clears.
+            let value = vs.get_str(field).to_ascii_lowercase();
+            if !matches!(value.as_str(), "unknown" | "off" | "disabled") {
+                push(AlertKind::Mode, AlertSeverity::Warning, label.into());
+            }
+        }
+
+        let data_age = vs
+            .last_sync()
+            .and_then(parse_iso)
+            .map(|(utc, _)| Utc::now().signed_duration_since(utc))
+            .filter(|age| age.num_minutes() >= Self::STALE_AFTER_MINS)
+            .map(|age| {
+                if age.num_hours() >= 24 {
+                    format!("{}d ago", age.num_days())
+                } else if age.num_hours() >= 1 {
+                    format!("{}h {}m ago", age.num_hours(), age.num_minutes() % 60)
+                } else {
+                    format!("{}m ago", age.num_minutes())
+                }
+            });
+
+        Self { items, data_age }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -85,6 +260,15 @@ pub struct SoftwareView {
     pub install_time: String,
     pub progress_summary: String,
     pub update_available: bool,
+    /// A download or install is actively progressing. Renderers gate the
+    /// progress-detail rows on this instead of comparing formatted strings
+    /// against the "—" placeholder, which silently breaks if the placeholder
+    /// ever changes.
+    pub is_installing: bool,
+    /// The vehicle reports a staged install (otaInstallReady carries a real
+    /// value) even if no progress is currently moving — e.g. downloaded and
+    /// waiting for the scheduled install window.
+    pub is_install_staged: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -93,6 +277,22 @@ pub struct LocationView {
     pub heading: String,
     pub altitude_ft: String,
     pub last_sync: String,
+}
+
+/// A single derived driving trip, pre-formatted for display. `when` is the
+/// trip's end time (humanized); `distance`/`energy`/`efficiency` fall back to a
+/// dash when the underlying snapshots couldn't supply them. `when_short` and
+/// the raw `efficiency_value` exist for the TUI, which needs a compact
+/// timestamp and a number to color-grade.
+#[derive(Debug, Clone, Serialize)]
+pub struct TripView {
+    pub when: String,
+    pub when_short: String,
+    pub distance: String,
+    pub energy: String,
+    pub efficiency: String,
+    pub efficiency_value: Option<f64>,
+    pub soc_delta: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -131,6 +331,7 @@ pub struct ChargingStatsView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ChargeInsightView {
     pub when: String,
+    pub when_short: String,
     pub energy_kwh: String,
     pub range_added_miles: String,
     pub efficiency_mi_per_kwh: String,
@@ -140,7 +341,7 @@ pub struct ChargeInsightView {
 
 impl DashboardView {
     pub fn from_data(data: &DashboardData) -> Self {
-        let (battery, charging, climate, vehicle, software, location) =
+        let (battery, charging, climate, vehicle, software, location, alerts) =
             match data.vehicle_state.as_ref() {
                 Some(vs) => (
                     BatteryView::from_state(vs),
@@ -149,6 +350,7 @@ impl DashboardView {
                     VehicleView::from_state(vs),
                     SoftwareView::from_state(vs),
                     LocationView::from_state(vs),
+                    AlertsView::from_state(vs),
                 ),
                 None => Default::default(),
             };
@@ -165,6 +367,7 @@ impl DashboardView {
             software,
             location,
             trend: data.recent_trend.iter().map(TrendPointView::from).collect(),
+            trips: data.recent_trips.iter().map(TripView::from).collect(),
             last_charge: data
                 .last_charge_session
                 .as_ref()
@@ -174,6 +377,7 @@ impl DashboardView {
                 .as_ref()
                 .map(LiveChargeView::from),
             charging_stats: data.charging_stats.as_ref().map(ChargingStatsView::from),
+            alerts,
         }
     }
 }
@@ -225,13 +429,21 @@ impl BatteryView {
 impl ChargingView {
     fn from_state(vs: &VehicleStateFields) -> Self {
         Self {
-            state: vs.charger_state_str().to_string(),
-            status: vs.charger_status_str().to_string(),
+            state: humanize_charger_token(vs.charger_state_str()),
+            status: humanize_charger_token(vs.charger_status_str()),
             time_to_full: vs.time_to_full().unwrap_or_else(|| "—".into()),
-            port_state: vs.get_str(&vs.charge_port_state).to_string(),
+            port_state: humanize_charger_token(vs.get_str(&vs.charge_port_state)),
             is_active: vs.is_actively_charging(),
         }
     }
+}
+
+/// Turn Rivian's snake_case charger tokens into something readable. Strips
+/// the `chrgr_sts_` prefix on status tokens so "chrgr_sts_not_connected"
+/// reads as "not connected" rather than "chrgr sts not connected".
+fn humanize_charger_token(raw: &str) -> String {
+    let stripped = raw.strip_prefix("chrgr_sts_").unwrap_or(raw);
+    stripped.replace('_', " ")
 }
 
 impl ClimateView {
@@ -334,9 +546,7 @@ impl SoftwareView {
         let current = display(vs, &vs.ota_current_version);
         let available_raw = display(vs, &vs.ota_available_version);
 
-        // Match the TUI: "0.0.0" / "—" / same-as-current all mean "no update".
-        let update_available =
-            available_raw != "—" && available_raw != "0.0.0" && available_raw != current;
+        let update_available = vs.update_available();
         let available_version = if update_available {
             available_raw
         } else {
@@ -401,6 +611,9 @@ impl SoftwareView {
             "idle".into()
         };
 
+        let is_installing = installing.is_some() || downloading.is_some();
+        let is_install_staged = install_ready != "—";
+
         Self {
             current_version: current,
             current_version_date: version_date(
@@ -419,6 +632,8 @@ impl SoftwareView {
             install_time,
             progress_summary,
             update_available,
+            is_installing,
+            is_install_staged,
         }
     }
 }
@@ -444,20 +659,53 @@ impl From<&VehicleTrendPoint> for TrendPointView {
     fn from(p: &VehicleTrendPoint) -> Self {
         Self {
             battery_percent: p.battery_level,
-            range_miles: p.range_km.map(|km| km / 1.60934),
-            mileage_miles: p.vehicle_mileage_m.map(|m| m / 1609.344),
-            speed_mph: p.speed_kmh.map(|kmh| kmh / 1.60934),
+            range_miles: p.range_km.map(|km| km / KM_PER_MI),
+            mileage_miles: p.vehicle_mileage_m.map(|m| m / METERS_PER_MI),
+            speed_mph: p.speed_kmh.map(|kmh| kmh / KM_PER_MI),
+        }
+    }
+}
+
+impl From<&Trip> for TripView {
+    fn from(trip: &Trip) -> Self {
+        let when_ts = trip.when_ts();
+        let when = when_ts.map(humanize_iso).unwrap_or_else(|| "—".into());
+        let when_short = when_ts
+            .map(humanize_iso_short)
+            .unwrap_or_else(|| "—".into());
+
+        let soc_delta = match (trip.start_soc, trip.end_soc) {
+            (Some(start), Some(end)) => format!("{start:.0}% → {end:.0}%"),
+            _ => "—".into(),
+        };
+
+        Self {
+            when,
+            when_short,
+            distance: format!("{:.1} mi", trip.distance_mi),
+            energy: trip
+                .energy_kwh
+                .map(|kwh| format!("{kwh:.1} kWh"))
+                .unwrap_or_else(|| "—".into()),
+            efficiency: trip
+                .efficiency_mi_per_kwh
+                .map(|eff| format!("{eff:.1} mi/kWh"))
+                .unwrap_or_else(|| "—".into()),
+            efficiency_value: trip.efficiency_mi_per_kwh,
+            soc_delta,
         }
     }
 }
 
 impl From<&ChargeSessionSummary> for ChargeInsightView {
     fn from(session: &ChargeSessionSummary) -> Self {
-        let when = session
+        let when_ts = session
             .end_instant
             .as_deref()
-            .or(session.start_instant.as_deref())
-            .map(humanize_iso)
+            .or(session.start_instant.as_deref());
+        let when = when_ts.map(humanize_iso).unwrap_or_else(|| "—".into());
+        let when_short = when_ts
+            .map(humanize_iso_short)
             .unwrap_or_else(|| "—".into());
 
         let location = match (session.vendor.as_deref(), session.city.as_deref()) {
@@ -481,20 +729,21 @@ impl From<&ChargeSessionSummary> for ChargeInsightView {
 
         let efficiency_mi_per_kwh = match (session.range_added_km, session.total_energy_kwh) {
             (Some(km), Some(kwh)) if kwh > 0.0 && km > 0.0 => {
-                format!("{:.1} mi/kWh", (km / 1.60934) / kwh)
+                format!("{:.1} mi/kWh", (km / KM_PER_MI) / kwh)
             }
             _ => "—".into(),
         };
 
         Self {
             when,
+            when_short,
             energy_kwh: session
                 .total_energy_kwh
                 .map(|v| format!("{v:.1} kWh"))
                 .unwrap_or_else(|| "—".into()),
             range_added_miles: session
                 .range_added_km
-                .map(|km| format!("{:.0} mi", km / 1.60934))
+                .map(|km| format!("{:.0} mi", km / KM_PER_MI))
                 .unwrap_or_else(|| "—".into()),
             efficiency_mi_per_kwh,
             location,
@@ -602,7 +851,7 @@ impl From<&ChargingStats> for ChargingStatsView {
         Self {
             session_count: stats.session_count.to_string(),
             total_energy_kwh: format!("{:.0} kWh", stats.total_energy_kwh),
-            total_range_miles: format!("{:.0} mi", stats.total_range_km / 1.60934),
+            total_range_miles: format!("{:.0} mi", stats.total_range_km / KM_PER_MI),
             avg_mi_per_kwh: fmt_eff(stats.avg_mi_per_kwh),
             best_mi_per_kwh: fmt_eff(stats.best_mi_per_kwh),
             worst_mi_per_kwh: fmt_eff(stats.worst_mi_per_kwh),
@@ -617,9 +866,11 @@ fn format_last_update(ts: Option<DateTime<Utc>>) -> String {
         return "never".to_string();
     };
     let local: DateTime<Local> = ts.into();
+    // Include the UTC offset so a remote viewer can disambiguate the
+    // server's local time from their own.
     format!(
         "{} ({})",
-        local.format("%Y-%m-%d %H:%M:%S"),
+        local.format("%Y-%m-%d %H:%M:%S %z"),
         relative_age(ts)
     )
 }
@@ -642,16 +893,45 @@ fn relative_age(ts: DateTime<Utc>) -> String {
     }
 }
 
-/// Format an RFC3339 timestamp as local-time + relative age. Falls back to
-/// the original string if parsing fails so we never silently lose data.
-fn humanize_iso(ts: &str) -> String {
-    match DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => {
-            let utc = dt.with_timezone(&Utc);
-            let local: DateTime<Local> = utc.into();
+/// Parse an RFC3339 timestamp into (UTC, Local) once; every humanize_*
+/// variant formats off this single parser so they can't drift on parse or
+/// timezone behavior.
+fn parse_iso(ts: &str) -> Option<(DateTime<Utc>, DateTime<Local>)> {
+    let utc = DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc);
+    Some((utc, utc.into()))
+}
+
+/// Compact local-time label (`Jun 08 14:30`) for space-constrained renderers
+/// like the TUI trips panel. Falls back to the raw string on parse failure.
+pub fn humanize_iso_short(ts: &str) -> String {
+    match parse_iso(ts) {
+        Some((_, local)) => local.format("%b %d %H:%M").to_string(),
+        None => ts.to_string(),
+    }
+}
+
+/// Local time + relative age without a UTC offset (`Jun 08 14:30 (2h ago)`).
+/// For the TUI, where the viewer is by definition in the server's timezone —
+/// the `%z` suffix that remote web viewers need only eats panel width here.
+pub fn humanize_iso_local(ts: &str) -> String {
+    match parse_iso(ts) {
+        Some((utc, local)) => {
             format!("{} ({})", local.format("%b %d %H:%M"), relative_age(utc))
         }
-        Err(_) => ts.to_string(),
+        None => ts.to_string(),
+    }
+}
+
+/// Format an RFC3339 timestamp as local-time + UTC offset + relative age.
+/// Falls back to the original string if parsing fails so we never silently
+/// lose data. The offset lets a remote web viewer disambiguate the server's
+/// local time from their own.
+pub fn humanize_iso(ts: &str) -> String {
+    match parse_iso(ts) {
+        Some((utc, local)) => {
+            format!("{} ({})", local.format("%b %d %H:%M %z"), relative_age(utc))
+        }
+        None => ts.to_string(),
     }
 }
 
@@ -686,6 +966,69 @@ mod tests {
     #[test]
     fn humanize_iso_returns_input_for_unparseable_string() {
         assert_eq!(humanize_iso("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn pet_mode_off_does_not_alert_regardless_of_case() {
+        // The wire reports "Off" / "Disabled" (observed in real snapshots);
+        // a case-sensitive clear-list treated "Off" as active and the pet
+        // mode alert never cleared.
+        for cleared in ["Off", "off", "Disabled", "disabled", "unknown"] {
+            let vs = VehicleStateFields {
+                pet_mode_status: Some(StateValue {
+                    value: json!(cleared),
+                }),
+                ..Default::default()
+            };
+            let alerts = AlertsView::from_state(&vs);
+            assert!(
+                alerts.items.is_empty(),
+                "pet mode '{cleared}' must not alert: {:?}",
+                alerts.items
+            );
+        }
+
+        let vs = VehicleStateFields {
+            pet_mode_status: Some(StateValue { value: json!("On") }),
+            ..Default::default()
+        };
+        let alerts = AlertsView::from_state(&vs);
+        assert_eq!(alerts.items.len(), 1);
+        assert_eq!(alerts.items[0].message, "Pet mode");
+    }
+
+    #[test]
+    fn alerts_carry_data_age_when_cloud_sync_is_stale() {
+        use crate::api::types::CloudConnection;
+
+        let stale_sync = (Utc::now() - chrono::Duration::minutes(95)).to_rfc3339();
+        let vs = VehicleStateFields {
+            window_front_left_closed: Some(StateValue {
+                value: json!("open"),
+            }),
+            cloud_connection: Some(CloudConnection {
+                last_sync: Some(stale_sync),
+            }),
+            ..Default::default()
+        };
+
+        let alerts = AlertsView::from_state(&vs);
+        assert_eq!(alerts.items.len(), 1);
+        assert_eq!(alerts.items[0].message, "Window open");
+        let age = alerts.data_age.expect("stale sync must set data_age");
+        assert!(age.starts_with("1h"), "expected ~1h35m age, got {age}");
+
+        // Fresh sync → no age qualifier; the data is effectively live.
+        let vs_fresh = VehicleStateFields {
+            window_front_left_closed: Some(StateValue {
+                value: json!("open"),
+            }),
+            cloud_connection: Some(CloudConnection {
+                last_sync: Some(Utc::now().to_rfc3339()),
+            }),
+            ..Default::default()
+        };
+        assert!(AlertsView::from_state(&vs_fresh).data_age.is_none());
     }
 
     #[test]

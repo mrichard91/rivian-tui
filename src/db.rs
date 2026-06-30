@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::api::types::{ChargingSession, LiveChargingSession, VehicleStateFields};
+use crate::api::types::{
+    ChargingSession, LiveChargingSession, VehicleStateFields, KM_PER_MI, METERS_PER_MI,
+};
 
 const DB_NAME: &str = "rivian.db";
 
@@ -32,6 +34,151 @@ pub struct ChargeSessionSummary {
     pub charger_type: Option<String>,
     pub is_public: Option<bool>,
     pub is_home_charger: Option<bool>,
+}
+
+/// A single derived driving trip. Currently reconstructed from stored
+/// `vehicle_state` snapshots (odometer + state-of-charge deltas across a
+/// contiguous moving segment), but the struct is intentionally source-agnostic
+/// so a future Rivian trip/energy-history GraphQL query can populate the same
+/// shape without touching the renderers. `energy_kwh` / `efficiency_mi_per_kwh`
+/// are `None` when the snapshots lack the SOC or pack-capacity data needed to
+/// compute them (or when net SOC rose, e.g. heavy regen downhill).
+#[derive(Debug, Clone, Serialize)]
+pub struct Trip {
+    pub start_ts: Option<String>,
+    pub end_ts: Option<String>,
+    pub distance_mi: f64,
+    pub start_soc: Option<f64>,
+    pub end_soc: Option<f64>,
+    pub energy_kwh: Option<f64>,
+    pub efficiency_mi_per_kwh: Option<f64>,
+}
+
+impl Trip {
+    /// The timestamp a renderer should display for this trip: the end time,
+    /// falling back to the start. Lives on the type so the TUI and web views
+    /// can't drift on the fallback policy.
+    pub fn when_ts(&self) -> Option<&str> {
+        self.end_ts.as_deref().or(self.start_ts.as_deref())
+    }
+}
+
+/// Raw per-snapshot fields the trip segmenter consumes. Kept separate from the
+/// public `Trip` so the segmentation logic is a pure function over plain data
+/// and can be unit-tested without a database.
+#[derive(Debug, Clone)]
+struct TripPoint {
+    ts: Option<String>,
+    odometer_m: Option<f64>,
+    soc: Option<f64>,
+    capacity_kwh: Option<f64>,
+}
+
+/// Parse a stored snapshot timestamp into Unix seconds. Snapshots use the
+/// SQLite `strftime('%Y-%m-%dT%H:%M:%SZ')` format, which is valid RFC3339.
+fn ts_secs(ts: &Option<String>) -> Option<i64> {
+    ts.as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|dt| dt.timestamp())
+}
+
+/// Reconstruct trips from an ascending-by-time slice of snapshots.
+///
+/// A trip is a maximal run of consecutive snapshots whose odometer advanced
+/// faster than a walking-pace floor between samples; a sample with no movement
+/// ends the current trip. The movement test is speed-based (odometer delta /
+/// time delta) so it holds at any poll cadence; when timestamps are missing or
+/// non-increasing it falls back to a fixed distance floor calibrated to the
+/// default 5-minute cadence. A gap longer than `MAX_GAP_SECS` between samples
+/// also ends the current trip — whatever happened while we weren't sampling
+/// (driving, charging) cannot be attributed, and merging across it produces
+/// trips with wildly wrong efficiency. Trips shorter than `MIN_TRIP_MI` are
+/// dropped as odometer noise. Returned oldest-first.
+fn segment_trips(points: &[TripPoint]) -> Vec<Trip> {
+    // ~1.1 mph: below this average speed between samples the car is parked.
+    const MOVE_SPEED_MPS: f64 = 0.5;
+    // Fallback distance floor when timestamps are unusable (≈0.1 mi, the
+    // historical threshold for 5-minute samples).
+    const MOVE_THRESHOLD_M: f64 = 161.0;
+    // Samples further apart than this are different observation sessions —
+    // never bridge them into one trip.
+    const MAX_GAP_SECS: i64 = 1800;
+    // Ignore sub-quarter-mile blips so a creep in a parking lot isn't a trip.
+    const MIN_TRIP_MI: f64 = 0.25;
+    // Efficiency needs a real amount of energy to be meaningful.
+    const MIN_ENERGY_KWH: f64 = 0.2;
+
+    let pts: Vec<&TripPoint> = points.iter().filter(|p| p.odometer_m.is_some()).collect();
+    if pts.len() < 2 {
+        return Vec::new();
+    }
+
+    let make_trip = |start: &TripPoint, end: &TripPoint| -> Option<Trip> {
+        let distance_mi = (end.odometer_m? - start.odometer_m?) / METERS_PER_MI;
+        if distance_mi < MIN_TRIP_MI {
+            return None;
+        }
+
+        // Net energy used = SOC drop × usable pack capacity. Prefer the
+        // capacity reported at trip end, falling back to the start sample.
+        let capacity = end.capacity_kwh.or(start.capacity_kwh);
+        let (energy_kwh, efficiency) = match (start.soc, end.soc, capacity) {
+            (Some(s0), Some(s1), Some(cap)) if s0 - s1 > 0.0 && cap > 0.0 => {
+                let energy = (s0 - s1) / 100.0 * cap;
+                if energy >= MIN_ENERGY_KWH {
+                    (Some(energy), Some(distance_mi / energy))
+                } else {
+                    (Some(energy), None)
+                }
+            }
+            _ => (None, None),
+        };
+
+        Some(Trip {
+            start_ts: start.ts.clone(),
+            end_ts: end.ts.clone(),
+            distance_mi,
+            start_soc: start.soc,
+            end_soc: end.soc,
+            energy_kwh,
+            efficiency_mi_per_kwh: efficiency,
+        })
+    };
+
+    let mut trips = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut end = 0usize;
+    for j in 1..pts.len() {
+        let odo_delta = pts[j].odometer_m.unwrap() - pts[j - 1].odometer_m.unwrap();
+        let gap_secs = match (ts_secs(&pts[j - 1].ts), ts_secs(&pts[j].ts)) {
+            (Some(a), Some(b)) if b > a => Some(b - a),
+            _ => None,
+        };
+        let gap_too_large = gap_secs.is_some_and(|g| g > MAX_GAP_SECS);
+        let moved = !gap_too_large
+            && match gap_secs {
+                Some(g) => odo_delta / g as f64 > MOVE_SPEED_MPS,
+                None => odo_delta > MOVE_THRESHOLD_M,
+            };
+
+        if moved {
+            if start.is_none() {
+                start = Some(j - 1);
+            }
+            end = j;
+        } else if let Some(s) = start.take() {
+            if let Some(trip) = make_trip(pts[s], pts[end]) {
+                trips.push(trip);
+            }
+        }
+    }
+    if let Some(s) = start.take() {
+        if let Some(trip) = make_trip(pts[s], pts[end]) {
+            trips.push(trip);
+        }
+    }
+
+    trips
 }
 
 /// Lifetime / aggregate charging statistics derived from `charging_sessions`.
@@ -72,6 +219,103 @@ fn charging_session_dedupe_key(session: &ChargingSession) -> String {
     )
 }
 
+/// Canonical schema for the `vehicle_state` data columns (everything except
+/// the fixed id/ts/vehicle_id prefix). This single list drives BOTH the
+/// CREATE TABLE for new databases AND the migration backfill for existing
+/// ones — the previous design kept a separate hand-maintained ALTER list,
+/// which drifted: the door/closure "closed" columns were never added to it,
+/// so legacy databases rejected every snapshot insert ("no column named
+/// door_fl_closed") and silently stopped recording history.
+const VEHICLE_STATE_DATA_COLUMNS: &[(&str, &str)] = &[
+    // power & drive
+    ("power_state", "TEXT"),
+    ("drive_mode", "TEXT"),
+    ("gear_status", "TEXT"),
+    ("vehicle_mileage_m", "REAL"),
+    // battery & charging
+    ("battery_level", "REAL"),
+    ("battery_limit", "REAL"),
+    ("battery_capacity", "REAL"),
+    ("distance_to_empty_km", "REAL"),
+    ("charger_status", "TEXT"),
+    ("charger_state", "TEXT"),
+    ("time_to_end_of_charge", "REAL"),
+    ("charge_port_state", "TEXT"),
+    ("charger_derate", "TEXT"),
+    ("remote_charging_available", "REAL"),
+    ("battery_hv_thermal", "TEXT"),
+    // climate
+    ("cabin_temp_c", "REAL"),
+    ("driver_temp_c", "REAL"),
+    ("cabin_preconditioning", "TEXT"),
+    ("preconditioning_type", "TEXT"),
+    ("defrost_defog", "TEXT"),
+    ("seat_heat_fl", "TEXT"),
+    ("seat_heat_fr", "TEXT"),
+    ("seat_heat_rl", "TEXT"),
+    ("seat_heat_rr", "TEXT"),
+    ("seat_vent_fl", "TEXT"),
+    ("seat_vent_fr", "TEXT"),
+    ("steering_wheel_heat", "TEXT"),
+    // location
+    ("latitude", "REAL"),
+    ("longitude", "REAL"),
+    ("speed", "REAL"),
+    ("altitude", "REAL"),
+    ("bearing", "REAL"),
+    // connectivity
+    ("last_sync", "TEXT"),
+    // OTA
+    ("ota_current", "TEXT"),
+    ("ota_available", "TEXT"),
+    ("ota_status", "TEXT"),
+    ("ota_current_status", "TEXT"),
+    ("ota_download_progress", "REAL"),
+    ("ota_install_progress", "REAL"),
+    ("ota_install_ready", "TEXT"),
+    // doors (closed + locked)
+    ("door_fl_closed", "TEXT"),
+    ("door_fr_closed", "TEXT"),
+    ("door_rl_closed", "TEXT"),
+    ("door_rr_closed", "TEXT"),
+    ("door_fl_locked", "TEXT"),
+    ("door_fr_locked", "TEXT"),
+    ("door_rl_locked", "TEXT"),
+    ("door_rr_locked", "TEXT"),
+    ("frunk_closed", "TEXT"),
+    ("frunk_locked", "TEXT"),
+    ("liftgate_closed", "TEXT"),
+    ("liftgate_locked", "TEXT"),
+    ("tailgate_closed", "TEXT"),
+    ("tailgate_locked", "TEXT"),
+    ("side_bin_l", "TEXT"),
+    ("side_bin_r", "TEXT"),
+    // windows
+    ("window_fl", "TEXT"),
+    ("window_fr", "TEXT"),
+    ("window_rl", "TEXT"),
+    ("window_rr", "TEXT"),
+    // tires
+    ("tire_fl", "TEXT"),
+    ("tire_fr", "TEXT"),
+    ("tire_rl", "TEXT"),
+    ("tire_rr", "TEXT"),
+    // security & misc
+    ("pet_mode", "TEXT"),
+    ("pet_mode_temp", "TEXT"),
+    ("gear_guard", "TEXT"),
+    ("gear_guard_video", "TEXT"),
+    ("gear_guard_video_mode", "TEXT"),
+    ("alarm_status", "TEXT"),
+    ("wiper_fluid", "TEXT"),
+    ("limited_accel_cold", "REAL"),
+    ("limited_regen_cold", "REAL"),
+    ("twelve_v_health", "TEXT"),
+    ("service_mode", "TEXT"),
+    ("trailer_status", "TEXT"),
+    ("car_wash_mode", "TEXT"),
+];
+
 impl Db {
     pub fn open() -> Result<Self> {
         let path = Self::db_path()?;
@@ -94,108 +338,18 @@ impl Db {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch(
+        let vehicle_state_cols = VEHICLE_STATE_DATA_COLUMNS
+            .iter()
+            .map(|(name, ty)| format!("                {name} {ty}"))
+            .collect::<Vec<_>>()
+            .join(",\n");
+
+        self.conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS vehicle_state (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 vehicle_id      TEXT,
-
-                -- power & drive
-                power_state     TEXT,
-                drive_mode      TEXT,
-                gear_status     TEXT,
-                vehicle_mileage_m REAL,
-
-                -- battery & charging
-                battery_level   REAL,
-                battery_limit   REAL,
-                battery_capacity REAL,
-                distance_to_empty_km REAL,
-                charger_status  TEXT,
-                charger_state   TEXT,
-                time_to_end_of_charge REAL,
-                charge_port_state TEXT,
-                charger_derate  TEXT,
-                remote_charging_available REAL,
-                battery_hv_thermal TEXT,
-
-                -- climate
-                cabin_temp_c    REAL,
-                driver_temp_c   REAL,
-                cabin_preconditioning TEXT,
-                preconditioning_type TEXT,
-                defrost_defog   TEXT,
-                seat_heat_fl    TEXT,
-                seat_heat_fr    TEXT,
-                seat_heat_rl    TEXT,
-                seat_heat_rr    TEXT,
-                seat_vent_fl    TEXT,
-                seat_vent_fr    TEXT,
-                steering_wheel_heat TEXT,
-
-                -- location
-                latitude        REAL,
-                longitude       REAL,
-                speed           REAL,
-                altitude        REAL,
-                bearing         REAL,
-
-                -- connectivity
-                last_sync       TEXT,
-
-                -- OTA
-                ota_current     TEXT,
-                ota_available   TEXT,
-                ota_status      TEXT,
-                ota_current_status TEXT,
-                ota_download_progress REAL,
-                ota_install_progress REAL,
-                ota_install_ready TEXT,
-
-                -- doors (closed + locked)
-                door_fl_closed  TEXT,
-                door_fr_closed  TEXT,
-                door_rl_closed  TEXT,
-                door_rr_closed  TEXT,
-                door_fl_locked  TEXT,
-                door_fr_locked  TEXT,
-                door_rl_locked  TEXT,
-                door_rr_locked  TEXT,
-                frunk_closed    TEXT,
-                frunk_locked    TEXT,
-                liftgate_closed TEXT,
-                liftgate_locked TEXT,
-                tailgate_closed TEXT,
-                tailgate_locked TEXT,
-                side_bin_l      TEXT,
-                side_bin_r      TEXT,
-
-                -- windows
-                window_fl       TEXT,
-                window_fr       TEXT,
-                window_rl       TEXT,
-                window_rr       TEXT,
-
-                -- tires
-                tire_fl         TEXT,
-                tire_fr         TEXT,
-                tire_rl         TEXT,
-                tire_rr         TEXT,
-
-                -- security & misc
-                pet_mode        TEXT,
-                pet_mode_temp   TEXT,
-                gear_guard      TEXT,
-                gear_guard_video TEXT,
-                gear_guard_video_mode TEXT,
-                alarm_status    TEXT,
-                wiper_fluid     TEXT,
-                limited_accel_cold REAL,
-                limited_regen_cold REAL,
-                twelve_v_health TEXT,
-                service_mode    TEXT,
-                trailer_status  TEXT,
-                car_wash_mode   TEXT
+{vehicle_state_cols}
             );
 
             CREATE INDEX IF NOT EXISTS idx_vs_ts ON vehicle_state(ts);
@@ -249,54 +403,20 @@ impl Db {
                 ON live_charging_snapshots(vehicle_id, ts);
             CREATE INDEX IF NOT EXISTS idx_lcs_session
                 ON live_charging_snapshots(vehicle_id, session_start);",
-        )?;
+        ))?;
 
-        // Add columns that may not exist in older DBs
-        let add_cols = [
-            "distance_to_empty_km REAL",
-            "charge_port_state TEXT",
-            "charger_derate TEXT",
-            "remote_charging_available REAL",
-            "battery_hv_thermal TEXT",
-            "driver_temp_c REAL",
-            "preconditioning_type TEXT",
-            "seat_heat_rl TEXT",
-            "seat_heat_rr TEXT",
-            "seat_vent_fl TEXT",
-            "seat_vent_fr TEXT",
-            "speed REAL",
-            "altitude REAL",
-            "bearing REAL",
-            "ota_current_status TEXT",
-            "ota_download_progress REAL",
-            "ota_install_progress REAL",
-            "ota_install_ready TEXT",
-            "door_fl_locked TEXT",
-            "door_fr_locked TEXT",
-            "door_rl_locked TEXT",
-            "door_rr_locked TEXT",
-            "frunk_locked TEXT",
-            "liftgate_locked TEXT",
-            "tailgate_locked TEXT",
-            "side_bin_l TEXT",
-            "side_bin_r TEXT",
-            "pet_mode_temp TEXT",
-            "gear_guard_video TEXT",
-            "gear_guard_video_mode TEXT",
-            "alarm_status TEXT",
-            "wiper_fluid TEXT",
-            "service_mode TEXT",
-            "trailer_status TEXT",
-            "car_wash_mode TEXT",
-        ];
-        for col in &add_cols {
-            let sql = format!("ALTER TABLE vehicle_state ADD COLUMN {col}");
-            // Ignore "duplicate column" errors
-            if let Err(e) = self.conn.execute_batch(&sql) {
-                let msg = e.to_string();
-                if !msg.contains("duplicate column") {
-                    return Err(e.into());
-                }
+        // Backfill any canonical column missing from an existing database.
+        // Introspection (not a hand-maintained list) so a column added to
+        // VEHICLE_STATE_DATA_COLUMNS can never be forgotten here.
+        let existing: std::collections::HashSet<String> = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('vehicle_state')")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (name, ty) in VEHICLE_STATE_DATA_COLUMNS {
+            if !existing.contains(*name) {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE vehicle_state ADD COLUMN {name} {ty}"))?;
             }
         }
 
@@ -446,29 +566,51 @@ impl Db {
     }
 
     /// Upsert charging sessions (dedup by transaction_id). Returns the new rows.
+    ///
+    /// `default_vehicle_id` is used to fill in `vehicle_id` when the API
+    /// response omits it (older payloads do this). On dedupe hits we also
+    /// backfill any existing rows that previously stored NULL, so the
+    /// strict-match queries below pick them up after a single refresh.
     pub fn upsert_charging_sessions(
         &self,
         sessions: &[ChargingSession],
+        default_vehicle_id: &str,
     ) -> Result<Vec<ChargingSession>> {
         let mut new_sessions = Vec::new();
         for s in sessions {
             let dedupe_key = charging_session_dedupe_key(s);
-            let result = self.conn.execute(
+            let effective_vehicle_id = s
+                .vehicle_id
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .unwrap_or(default_vehicle_id);
+            let inserted = self.conn.execute(
                 "INSERT OR IGNORE INTO charging_sessions (
                     transaction_id, dedupe_key, vehicle_id, vehicle_name, charger_type, vendor, city,
                     start_instant, end_instant, total_energy_kwh, range_added_km,
                     currency_code, paid_total, is_home_charger, is_public, is_roaming
                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 rusqlite::params![
-                    s.transaction_id, dedupe_key, s.vehicle_id, s.vehicle_name,
+                    s.transaction_id, dedupe_key, effective_vehicle_id, s.vehicle_name,
                     s.charger_type, s.vendor, s.city,
                     s.start_instant, s.end_instant, s.total_energy_kwh, s.range_added_km,
                     s.currency_code, s.paid_total,
                     s.is_home_charger, s.is_public, s.is_roaming_network,
                 ],
             )?;
-            if result > 0 {
+            if inserted > 0 {
                 new_sessions.push(s.clone());
+            } else {
+                // Existing row — opportunistically backfill vehicle_id so
+                // legacy rows that were inserted before this change become
+                // visible to the strict-match queries.
+                self.conn.execute(
+                    "UPDATE charging_sessions
+                     SET vehicle_id = ?1
+                     WHERE dedupe_key = ?2
+                       AND (vehicle_id IS NULL OR vehicle_id = '')",
+                    rusqlite::params![effective_vehicle_id, dedupe_key],
+                )?;
             }
         }
         Ok(new_sessions)
@@ -523,18 +665,83 @@ impl Db {
         Ok(points)
     }
 
+    /// Reconstruct the most recent driving trips for a vehicle from stored
+    /// snapshots, newest-first, capped at `limit`. Scans a bounded window of
+    /// recent snapshots so an idle car (few movements) still surfaces several
+    /// trips without an unbounded table scan.
+    ///
+    /// No Rivian GraphQL trip-history query is known to exist in any
+    /// open-source client, so this snapshot-derived view is the trip source.
+    /// If such a query is ever discovered, it can populate `Trip` directly and
+    /// this method becomes one of several sources behind the same type.
+    pub fn recent_trips(&self, vehicle_id: &str, limit: usize) -> Result<Vec<Trip>> {
+        // Bound the scan to the newest N snapshots to keep segmentation
+        // cheap. How much wall-clock history this covers scales with the poll
+        // cadence: ~3 weeks at the 5-minute default, ~2 days at the 30s
+        // minimum — acceptable, since faster polling implies an attended
+        // session where recent trips are the interesting ones.
+        const SCAN_CAP: i64 = 6000;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, vehicle_mileage_m, battery_level, battery_capacity
+             FROM (
+                 SELECT id, ts, vehicle_mileage_m, battery_level, battery_capacity
+                 FROM vehicle_state
+                 WHERE vehicle_id = ?1
+                 ORDER BY id DESC
+                 LIMIT ?2
+             )
+             ORDER BY id ASC",
+        )?;
+
+        let points: Vec<TripPoint> = stmt
+            .query_map((vehicle_id, SCAN_CAP), |row| {
+                Ok(TripPoint {
+                    ts: row.get(0)?,
+                    odometer_m: row.get(1)?,
+                    soc: row.get(2)?,
+                    capacity_kwh: row.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut trips = segment_trips(&points);
+        // segment_trips returns oldest-first; we want newest-first, capped.
+        trips.reverse();
+        trips.truncate(limit);
+        Ok(trips)
+    }
+
     pub fn latest_charging_session(
         &self,
         vehicle_id: &str,
     ) -> Result<Option<ChargeSessionSummary>> {
-        let mut stmt = self.conn.prepare(
+        // Same adaptive filter as charging_session_stats: rows inserted
+        // before vehicle_id was recorded have NULL/'' and are only backfilled
+        // when the API re-returns the same session, so until at least one
+        // vehicle-specific row exists, fall back to matching the legacy rows.
+        // Keeping the two queries on one policy prevents the Last-charge
+        // panel and the stats panel from disagreeing about the same table.
+        let vehicle_specific_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM charging_sessions WHERE vehicle_id = ?1",
+            [vehicle_id],
+            |r| r.get(0),
+        )?;
+        let vehicle_filter = if vehicle_specific_count > 0 {
+            "vehicle_id = ?1"
+        } else {
+            "vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = ''"
+        };
+
+        let sql = format!(
             "SELECT start_instant, end_instant, total_energy_kwh, range_added_km,
                     vendor, city, charger_type, is_public, is_home_charger
              FROM charging_sessions
-             WHERE vehicle_id = ?1 OR vehicle_id IS NULL OR vehicle_id = ''
+             WHERE {vehicle_filter}
              ORDER BY COALESCE(end_instant, start_instant, fetched_at) DESC
-             LIMIT 1",
-        )?;
+             LIMIT 1"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
 
         let result = stmt.query_row([vehicle_id], |row| {
             Ok(ChargeSessionSummary {
@@ -632,9 +839,9 @@ impl Db {
         // 2. mi/kWh aggregates filtered to realistic sessions
         let efficiency_sql = format!(
             "SELECT
-                AVG(range_km / 1.60934 / energy_kwh),
-                MAX(range_km / 1.60934 / energy_kwh),
-                MIN(range_km / 1.60934 / energy_kwh)
+                AVG(range_km / {KM_PER_MI} / energy_kwh),
+                MAX(range_km / {KM_PER_MI} / energy_kwh),
+                MIN(range_km / {KM_PER_MI} / energy_kwh)
              FROM (
                 SELECT total_energy_kwh AS energy_kwh, range_added_km AS range_km
                 FROM charging_sessions
@@ -659,7 +866,7 @@ impl Db {
                 "SELECT
                     COUNT(*),
                     AVG(CASE WHEN total_energy_kwh > 0.5 AND range_added_km > 0.5
-                              THEN range_added_km / 1.60934 / total_energy_kwh
+                              THEN range_added_km / {KM_PER_MI} / total_energy_kwh
                               ELSE NULL END)
                  FROM charging_sessions
                  WHERE ({vehicle_filter})
@@ -775,7 +982,7 @@ mod tests {
         };
 
         let inserted = db
-            .upsert_charging_sessions(&[session.clone(), session])
+            .upsert_charging_sessions(&[session.clone(), session], "vehicle-1")
             .unwrap();
 
         assert_eq!(inserted.len(), 1);
@@ -868,7 +1075,8 @@ mod tests {
             is_home_charger: Some(false),
         };
 
-        db.upsert_charging_sessions(&[older, newer]).unwrap();
+        db.upsert_charging_sessions(&[older, newer], "vehicle-1")
+            .unwrap();
 
         let latest = db.latest_charging_session("vehicle-1").unwrap().unwrap();
         assert_eq!(latest.vendor.as_deref(), Some("Rivian"));
@@ -961,7 +1169,7 @@ mod tests {
                 ..test_charging_session()
             },
         ];
-        db.upsert_charging_sessions(&sessions).unwrap();
+        db.upsert_charging_sessions(&sessions, "VIN-1").unwrap();
 
         let stats = db.charging_session_stats("VIN-1").unwrap().unwrap();
         assert_eq!(stats.session_count, 4);
@@ -1007,7 +1215,7 @@ mod tests {
                 ..test_charging_session()
             },
         ];
-        db.upsert_charging_sessions(&sessions).unwrap();
+        db.upsert_charging_sessions(&sessions, "").unwrap();
 
         let stats = db.charging_session_stats("VIN-1").unwrap().unwrap();
         assert_eq!(stats.session_count, 1);
@@ -1017,6 +1225,179 @@ mod tests {
         let legacy_stats = db.charging_session_stats("VIN-2").unwrap().unwrap();
         assert_eq!(legacy_stats.session_count, 1);
         assert!((legacy_stats.total_energy_kwh - 90.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn recent_trips_segments_driving_from_parked_periods() {
+        let db = make_test_db();
+
+        // Two trips separated by a parked period. Odometer in meters, SOC in %,
+        // capacity 135 kWh.
+        //   Trip 1: 0 -> 16093 m (10 mi), SOC 80 -> 76 (4% of 135 = 5.4 kWh)
+        //           => 10 / 5.4 ≈ 1.85 mi/kWh
+        //   parked: odometer flat
+        //   Trip 2: 16093 -> 48279 m (+20 mi), SOC 76 -> 68 (8% = 10.8 kWh)
+        //           => 20 / 10.8 ≈ 1.85 mi/kWh
+        let rows = [
+            (0.0, 80.0),     // start trip 1
+            (8046.0, 78.0),  // moving
+            (16093.0, 76.0), // end trip 1
+            (16093.0, 76.0), // parked
+            (16093.0, 76.0), // parked
+            (24139.0, 73.0), // start trip 2 (movement resumes)
+            (48279.0, 68.0), // end trip 2
+            (48279.0, 68.0), // parked
+        ];
+        for (odo, soc) in rows {
+            let json = format!(
+                r#"{{
+                    "vehicleMileage": {{ "value": {odo} }},
+                    "batteryLevel": {{ "value": {soc} }},
+                    "batteryCapacity": {{ "value": 135.0 }}
+                }}"#
+            );
+            let vs: VehicleStateFields = serde_json::from_str(&json).unwrap();
+            db.insert_state("VIN-1", &vs).unwrap();
+        }
+
+        let trips = db.recent_trips("VIN-1", 5).unwrap();
+        assert_eq!(trips.len(), 2, "expected two distinct trips");
+
+        // Newest-first: trip 2 (20 mi) comes before trip 1 (10 mi).
+        let newest = &trips[0];
+        assert!((newest.distance_mi - 20.0).abs() < 0.05, "{newest:?}");
+        assert!((newest.energy_kwh.unwrap() - 10.8).abs() < 0.05);
+        assert!((newest.efficiency_mi_per_kwh.unwrap() - 20.0 / 10.8).abs() < 0.05);
+
+        let oldest = &trips[1];
+        assert!((oldest.distance_mi - 10.0).abs() < 0.05);
+        assert!((oldest.efficiency_mi_per_kwh.unwrap() - 10.0 / 5.4).abs() < 0.05);
+    }
+
+    #[test]
+    fn recent_trips_skips_noise_and_handles_missing_energy() {
+        let db = make_test_db();
+
+        // A sub-quarter-mile creep (200 m) must not register as a trip.
+        // A real trip with no SOC data yields distance but no efficiency.
+        let rows: [(f64, Option<f64>); 6] = [
+            (0.0, None),    // park
+            (200.0, None),  // tiny creep -> noise, below MIN_TRIP_MI
+            (200.0, None),  // park again
+            (200.0, None),  // last parked sample -> becomes trip start (odo 200 m)
+            (3219.0, None), // movement resumes
+            (6437.0, None), // trip end (no SOC -> no efficiency)
+        ];
+        for (odo, soc) in rows {
+            let soc_json = match soc {
+                Some(v) => format!(r#", "batteryLevel": {{ "value": {v} }}"#),
+                None => String::new(),
+            };
+            let json = format!(r#"{{ "vehicleMileage": {{ "value": {odo} }}{soc_json} }}"#);
+            let vs: VehicleStateFields = serde_json::from_str(&json).unwrap();
+            db.insert_state("VIN-1", &vs).unwrap();
+        }
+
+        let trips = db.recent_trips("VIN-1", 5).unwrap();
+        assert_eq!(trips.len(), 1, "noise creep must not be a trip: {trips:?}");
+        let trip = &trips[0];
+        // Trip spans the last parked sample (200 m) through the end (6437 m).
+        assert!((trip.distance_mi - (6437.0 - 200.0) / 1609.344).abs() < 0.05);
+        assert!(trip.energy_kwh.is_none());
+        assert!(trip.efficiency_mi_per_kwh.is_none());
+    }
+
+    #[test]
+    fn recent_trips_empty_when_no_snapshots() {
+        let db = make_test_db();
+        assert!(db.recent_trips("VIN-1", 5).unwrap().is_empty());
+    }
+
+    fn trip_point(ts: &str, odometer_m: f64, soc: Option<f64>) -> TripPoint {
+        TripPoint {
+            ts: Some(ts.into()),
+            odometer_m: Some(odometer_m),
+            soc,
+            capacity_kwh: soc.map(|_| 135.0),
+        }
+    }
+
+    #[test]
+    fn segment_trips_splits_on_large_time_gaps() {
+        // App offline for a day while the car drove 120 mi and charged: the
+        // two samples bridging the gap must NOT merge into one bogus trip
+        // (which would read as e.g. 120 mi on 5% SOC ≈ 18 mi/kWh).
+        let points = vec![
+            trip_point("2026-06-08T08:00:00Z", 0.0, Some(60.0)),
+            trip_point("2026-06-08T08:05:00Z", 8000.0, Some(58.0)),
+            trip_point("2026-06-08T08:10:00Z", 16000.0, Some(56.0)),
+            // 24h offline gap with 193 km driven and a charge in between.
+            trip_point("2026-06-09T08:10:00Z", 209000.0, Some(55.0)),
+            trip_point("2026-06-09T08:15:00Z", 209000.0, Some(55.0)),
+        ];
+
+        let trips = segment_trips(&points);
+        assert_eq!(trips.len(), 1, "gap must not be bridged: {trips:?}");
+        // Only the contiguous 16 km morning segment survives.
+        assert!((trips[0].distance_mi - 16000.0 / METERS_PER_MI).abs() < 0.05);
+    }
+
+    #[test]
+    fn segment_trips_movement_test_scales_with_cadence() {
+        // 30-second samples crawling at ~8 mph (≈107 m per sample): well under
+        // the old fixed 161 m floor, but clearly moving by speed. The whole
+        // crawl must come out as one trip, not be dropped as parked.
+        let mut points = Vec::new();
+        let mut odo = 0.0;
+        for i in 0..40 {
+            let ts = format!("2026-06-08T08:{:02}:{:02}Z", i / 2, (i % 2) * 30);
+            points.push(trip_point(&ts, odo, None));
+            odo += 107.0;
+        }
+        // Then parked.
+        points.push(trip_point("2026-06-08T08:25:00Z", odo, None));
+        points.push(trip_point("2026-06-08T08:30:00Z", odo, None));
+
+        let trips = segment_trips(&points);
+        assert_eq!(trips.len(), 1, "slow crawl must register: {trips:?}");
+        assert!((trips[0].distance_mi - 39.0 * 107.0 / METERS_PER_MI).abs() < 0.1);
+    }
+
+    #[test]
+    fn latest_charging_session_falls_back_to_legacy_rows() {
+        let db = make_test_db();
+
+        // A legacy row inserted before vehicle_id was recorded.
+        db.conn()
+            .execute(
+                "INSERT INTO charging_sessions
+                     (transaction_id, dedupe_key, vehicle_id, end_instant, total_energy_kwh)
+                 VALUES ('legacy-1', 'txn:legacy-1', NULL, '2026-05-01T10:00:00Z', 33.0)",
+                [],
+            )
+            .unwrap();
+
+        let session = db.latest_charging_session("VIN-1").unwrap();
+        assert!(
+            session.is_some(),
+            "legacy NULL-vehicle_id row must stay visible until backfilled"
+        );
+        assert_eq!(session.unwrap().total_energy_kwh, Some(33.0));
+
+        // Once a vehicle-specific row exists, strict matching takes over.
+        db.upsert_charging_sessions(
+            &[ChargingSession {
+                transaction_id: Some("new-1".into()),
+                vehicle_id: Some("VIN-1".into()),
+                end_instant: Some("2026-06-01T10:00:00Z".into()),
+                total_energy_kwh: Some(20.0),
+                ..test_charging_session()
+            }],
+            "VIN-1",
+        )
+        .unwrap();
+        let session = db.latest_charging_session("VIN-1").unwrap().unwrap();
+        assert_eq!(session.total_energy_kwh, Some(20.0));
     }
 
     fn test_charging_session() -> ChargingSession {
@@ -1037,6 +1418,75 @@ mod tests {
             is_public: Some(false),
             is_home_charger: Some(false),
         }
+    }
+
+    #[test]
+    fn migrate_backfills_door_closed_columns_on_legacy_db() {
+        // Reproduces the schema observed in a real pre-upgrade database: the
+        // door/closure "closed" columns were in CREATE TABLE but never in the
+        // old hand-maintained ALTER list, so legacy DBs lacked them and every
+        // insert_state failed — silently halting all snapshot recording
+        // (and with it, trip derivation) for months.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE vehicle_state (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                vehicle_id TEXT,
+                power_state TEXT,
+                drive_mode TEXT,
+                gear_status TEXT,
+                vehicle_mileage_m REAL,
+                battery_level REAL,
+                battery_limit REAL,
+                battery_capacity REAL,
+                charger_status TEXT,
+                charger_state TEXT,
+                time_to_end_of_charge REAL,
+                cabin_temp_c REAL,
+                cabin_preconditioning TEXT,
+                defrost_defog TEXT,
+                seat_heat_fl TEXT,
+                seat_heat_fr TEXT,
+                steering_wheel_heat TEXT,
+                latitude REAL,
+                longitude REAL,
+                last_sync TEXT,
+                ota_current TEXT,
+                ota_available TEXT,
+                ota_status TEXT,
+                window_fl TEXT,
+                window_fr TEXT,
+                window_rl TEXT,
+                window_rr TEXT,
+                tire_fl TEXT,
+                tire_fr TEXT,
+                tire_rl TEXT,
+                tire_rr TEXT,
+                pet_mode TEXT,
+                gear_guard TEXT,
+                limited_accel_cold REAL,
+                limited_regen_cold REAL,
+                twelve_v_health TEXT
+            );",
+        )
+        .unwrap();
+
+        let db = Db { conn };
+        db.migrate().unwrap();
+
+        // The legacy DB previously rejected this insert with
+        // "no column named door_fl_closed".
+        let vs: VehicleStateFields = serde_json::from_str(
+            r#"{
+                "batteryLevel": { "value": 70.0 },
+                "doorFrontLeftClosed": { "value": "closed" },
+                "closureFrunkClosed": { "value": "closed" }
+            }"#,
+        )
+        .unwrap();
+        let id = db.insert_state("VIN-LEGACY", &vs).unwrap();
+        assert!(id > 0);
     }
 
     #[test]

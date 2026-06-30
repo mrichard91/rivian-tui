@@ -1,7 +1,12 @@
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use crate::api::types::{KM_PER_MI, METERS_PER_MI};
 use crate::app::{App, LogLevel, LoginField, Mode};
+use crate::view_model::{
+    humanize_iso_local, AlertSeverity, AlertsView, ChargeInsightView, ChargingStatsView,
+    LiveChargeView, TripView,
+};
 
 /// Render a label:value line with the label padded to `w` chars
 fn kv(w: usize, label: &str, val: &str, color: Color) -> Line<'static> {
@@ -86,11 +91,11 @@ fn tagged_value(tag: &str, value: &str, color: Color) -> (String, Color) {
 }
 
 const R1T_ART: [&str; 5] = [
-    "        ________         ",
-    "   ____/[] [] \\___      ",
-    " _/ __   ____   _ \\_    ",
-    "|_/__|__|____|_[__|     ",
-    "  O--O------O--O        ",
+    "      .-~~~~~~~~~~~~-.      ",
+    "   .-'                '-.   ",
+    "  /   (|)==========(|)   \\  ",
+    " |_____|            |_____| ",
+    " '----/______________\\----' ",
 ];
 
 /// Main draw dispatcher
@@ -213,9 +218,9 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let alerts = collect_alerts(vs);
+    let alerts = AlertsView::from_state(vs);
     let mut body_constraints = Vec::new();
-    if !alerts.is_empty() {
+    if !alerts.items.is_empty() {
         body_constraints.push(Constraint::Length(3));
     }
     body_constraints.push(Constraint::Min(12));
@@ -224,7 +229,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     let sections = Layout::vertical(body_constraints).split(area);
     let mut section_idx = 0;
 
-    if !alerts.is_empty() {
+    if !alerts.items.is_empty() {
         draw_alert_strip(frame, sections[section_idx], &alerts);
         section_idx += 1;
     }
@@ -240,11 +245,16 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     draw_col_vehicle(frame, cols[1], vs);
     draw_col_status(frame, cols[2], vs);
 
-    let insights = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(sections[section_idx + 1]);
+    let insights = Layout::horizontal([
+        Constraint::Percentage(40),
+        Constraint::Percentage(28),
+        Constraint::Percentage(32),
+    ])
+    .split(sections[section_idx + 1]);
 
     draw_trend_panel(frame, insights[0], app, vs);
-    draw_charge_insights(frame, insights[1], app, vs);
+    draw_trips_panel(frame, insights[1], app);
+    draw_charge_insights(frame, insights[2], app, vs);
 }
 
 /// Left column: battery gauge + charging
@@ -533,7 +543,10 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     let progress = vs.ota_progress_summary().unwrap_or_else(|| "—".into());
     let location = vs.location_summary().unwrap_or_else(|| "—".into());
     let heading = vs.heading_summary().unwrap_or_else(|| "—".into());
-    let last_sync = vs.last_sync().unwrap_or("—");
+    let last_sync = vs
+        .last_sync()
+        .map(humanize_iso_local)
+        .unwrap_or_else(|| "—".to_string());
     let alarm = bool_badge(vs.get_boolish(&vs.alarm_sound_status), "on", "off");
     let guard = vs.get_str(&vs.gear_guard_video_status);
     let guard_color = status_color(guard);
@@ -542,7 +555,7 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     let mode_left = tagged_value("Svc", service, status_color(service));
     let mode_right = tagged_value("Wash", wash, status_color(wash));
 
-    let has_update = available != "0.0.0" && available != "unknown" && available != current;
+    let has_update = vs.update_available();
     let avail_color = if has_update {
         Color::Yellow
     } else {
@@ -556,7 +569,7 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
         kv(RW, "OTA", ota_status, status_color(ota_status)),
         kvw(RW, "Prog", &progress),
         kvw(RW, "Ready", install_ready),
-        kvw(RW, "Sync", last_sync),
+        kvw(RW, "Sync", &last_sync),
         kvw(RW, "Loc", &location),
         kvw(RW, "Head", &heading),
         kv_pair(
@@ -586,85 +599,14 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     );
 }
 
-fn collect_alerts(vs: &crate::api::types::VehicleStateFields) -> Vec<(String, Color)> {
-    let mut alerts = Vec::new();
-
-    let door_fields = [
-        &vs.door_front_left_closed,
-        &vs.door_front_right_closed,
-        &vs.door_rear_left_closed,
-        &vs.door_rear_right_closed,
-        &vs.closure_frunk_closed,
-        &vs.closure_liftgate_closed,
-    ];
-    if door_fields
-        .iter()
-        .any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open")))
-    {
-        alerts.push(("Door or hatch open".into(), Color::Red));
+fn alert_color(severity: AlertSeverity) -> Color {
+    match severity {
+        AlertSeverity::Critical => Color::Red,
+        AlertSeverity::Warning => Color::Yellow,
     }
-
-    let window_fields = [
-        &vs.window_front_left_closed,
-        &vs.window_front_right_closed,
-        &vs.window_rear_left_closed,
-        &vs.window_rear_right_closed,
-    ];
-    if window_fields
-        .iter()
-        .any(|field| matches!(field.as_ref().and_then(|v| v.as_str()), Some("open")))
-    {
-        alerts.push(("Window open".into(), Color::Red));
-    }
-
-    let tire_fields = [
-        &vs.tire_pressure_status_front_left,
-        &vs.tire_pressure_status_front_right,
-        &vs.tire_pressure_status_rear_left,
-        &vs.tire_pressure_status_rear_right,
-    ];
-    if tire_fields.iter().any(|field| {
-        field
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_ascii_lowercase().contains("low"))
-            .unwrap_or(false)
-    }) {
-        alerts.push(("Low tire pressure".into(), Color::Red));
-    }
-
-    if vs.get_f64(&vs.limited_accel_cold).unwrap_or(0.0) > 0.0
-        || vs.get_f64(&vs.limited_regen_cold).unwrap_or(0.0) > 0.0
-    {
-        alerts.push(("Cold-limited accel/regen".into(), Color::Yellow));
-    }
-
-    let available = vs.get_str(&vs.ota_available_version);
-    let current = vs.get_str(&vs.ota_current_version);
-    if available != "0.0.0" && available != "unknown" && available != current {
-        alerts.push((format!("OTA available {available}"), Color::Yellow));
-    }
-
-    let battery_12v = vs.get_str(&vs.twelve_volt_battery_health);
-    if battery_12v != "unknown" && battery_12v != "NORMAL_OPERATION" {
-        alerts.push((format!("12V {battery_12v}"), Color::Yellow));
-    }
-
-    for (label, field) in [
-        ("Service mode", &vs.service_mode),
-        ("Car wash mode", &vs.car_wash_mode),
-        ("Pet mode", &vs.pet_mode_status),
-    ] {
-        let value = vs.get_str(field);
-        if !matches!(value, "unknown" | "off" | "Disabled") {
-            alerts.push((label.into(), Color::Yellow));
-        }
-    }
-
-    alerts
 }
 
-fn draw_alert_strip(frame: &mut Frame, area: Rect, alerts: &[(String, Color)]) {
+fn draw_alert_strip(frame: &mut Frame, area: Rect, alerts: &AlertsView) {
     let mut spans = vec![Span::styled(
         " Alerts ",
         Style::default()
@@ -673,10 +615,23 @@ fn draw_alert_strip(frame: &mut Frame, area: Rect, alerts: &[(String, Color)]) {
             .add_modifier(Modifier::BOLD),
     )];
 
-    for (idx, (message, color)) in alerts.iter().enumerate() {
+    // The cloud serves the last-synced snapshot while the truck sleeps, so
+    // these alerts can describe state from a while ago. Say so up front
+    // rather than presenting e.g. "Window open" as live.
+    if let Some(age) = &alerts.data_age {
+        spans.push(Span::styled(
+            format!(" as of {age} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    for (idx, alert) in alerts.items.iter().enumerate() {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(message.clone(), Style::default().fg(*color)));
-        if idx + 1 != alerts.len() {
+        spans.push(Span::styled(
+            alert.message.clone(),
+            Style::default().fg(alert_color(alert.severity)),
+        ));
+        if idx + 1 != alerts.items.len() {
             spans.push(Span::styled(" • ", Style::default().fg(Color::DarkGray)));
         }
     }
@@ -702,11 +657,11 @@ fn trend_delta(app: &App) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>
     let range = first
         .and_then(|point| point.range_km)
         .zip(last.and_then(|point| point.range_km))
-        .map(|(start, end)| (end - start) / 1.60934);
+        .map(|(start, end)| (end - start) / KM_PER_MI);
     let mileage = first
         .and_then(|point| point.vehicle_mileage_m)
         .zip(last.and_then(|point| point.vehicle_mileage_m))
-        .map(|(start, end)| (end - start) / 1609.344);
+        .map(|(start, end)| (end - start) / METERS_PER_MI);
     let peak_speed = app
         .recent_trend
         .iter()
@@ -714,14 +669,17 @@ fn trend_delta(app: &App) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>
         .fold(None, |acc: Option<f64>, speed| {
             Some(acc.map_or(speed, |current| current.max(speed)))
         })
-        .map(|kmh| kmh / 1.60934);
+        .map(|kmh| kmh / KM_PER_MI);
 
     (battery, range, mileage, peak_speed)
 }
 
 fn sparkline_data(values: impl Iterator<Item = Option<f64>>, scale: f64) -> Vec<u64> {
+    // Drop missing samples rather than rendering them as zero, which would
+    // otherwise pull the line to the baseline and misrepresent the trend.
     values
-        .map(|value| (value.unwrap_or_default().max(0.0) * scale) as u64)
+        .flatten()
+        .map(|value| (value.max(0.0) * scale) as u64)
         .collect()
 }
 
@@ -755,9 +713,11 @@ fn draw_trend_panel(
     ])
     .split(inner);
 
+    // Compact labels: this panel is 40% of the body, so the line must
+    // survive ~30 columns on an 80-col terminal without losing the deltas.
     let (battery_delta, range_delta, mileage_delta, peak_speed) = trend_delta(app);
     let summary = format!(
-        "  {} snaps  ΔSOC {:+.1}%  ΔRange {:+.1} mi  ΔODO {:+.1} mi",
+        " {}sn ΔSOC{:+.1}% ΔRng{:+.0} ΔODO{:+.0}mi",
         app.recent_trend.len(),
         battery_delta.unwrap_or_default(),
         range_delta.unwrap_or_default(),
@@ -805,12 +765,12 @@ fn draw_trend_panel(
             .map(|v| format!("{v:.2}"))
             .unwrap_or_else(|| "—".into());
         format!(
-            "  {} chrg  {:.0} kWh  avg {avg}  best {best}  worst {worst} mi/kWh",
+            " {}chg {:.0}kWh avg{avg} hi{best} lo{worst}",
             stats.session_count, stats.total_energy_kwh,
         )
     } else {
         format!(
-            "  Now {:.0} mph  Peak {:.0} mph  Alt {:.0} ft",
+            " Now {:.0}mph Peak {:.0}mph Alt {:.0}ft",
             vs.speed_mph().unwrap_or_default(),
             peak_speed.unwrap_or_default(),
             vs.altitude_ft().unwrap_or_default(),
@@ -822,31 +782,69 @@ fn draw_trend_panel(
     );
 }
 
-fn format_charge_kind(session: &crate::db::ChargeSessionSummary) -> String {
-    if session.is_home_charger == Some(true) {
-        "home".into()
-    } else if session.is_public == Some(true) {
-        "public".into()
+/// Color the mi/kWh figure on a rough efficiency gradient. Rivian trucks live
+/// around 2 mi/kWh, so green/yellow/red are scaled to that reality rather than
+/// a sedan's.
+fn efficiency_color(mi_per_kwh: f64) -> Color {
+    if mi_per_kwh >= 2.5 {
+        Color::Green
+    } else if mi_per_kwh >= 1.8 {
+        Color::Yellow
     } else {
-        session
-            .charger_type
-            .clone()
-            .unwrap_or_else(|| "unknown".into())
+        Color::Red
     }
 }
 
-fn format_charge_time(session: &crate::db::ChargeSessionSummary) -> String {
-    session
-        .end_instant
-        .as_deref()
-        .or(session.start_instant.as_deref())
-        .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(stamp).ok())
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%b %d %H:%M")
-                .to_string()
+/// Last few driving trips, newest first: distance, mi/kWh efficiency, and end
+/// time, derived from the snapshot history. The metrics lead the line so on a
+/// narrow terminal it's the timestamp — not the mi/kWh — that gets truncated
+/// at the panel edge.
+fn draw_trips_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Trips ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if app.recent_trips.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  No trips yet — drive to log one")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    let lines: Vec<Line> = app
+        .recent_trips
+        .iter()
+        .map(|trip| {
+            let view = TripView::from(trip);
+            let eff_color = view
+                .efficiency_value
+                .map(efficiency_color)
+                .unwrap_or(Color::DarkGray);
+            let eff = view
+                .efficiency_value
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "—".into());
+
+            Line::from(vec![
+                Span::styled(
+                    format!(" {:>7}", view.distance.replace(' ', "")),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(format!(" {eff:<4}"), Style::default().fg(eff_color)),
+                Span::styled(
+                    format!(" {}", view.when_short),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
         })
-        .unwrap_or_else(|| "—".into())
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_charge_insights(
@@ -870,37 +868,10 @@ fn draw_charge_insights(
         // poll does not expose. Fall back to vehicle-state-only display
         // before the first live response arrives.
         if let Some(live) = &app.live_charging_session {
-            let power = live
-                .power_kw()
-                .map(|kw| format!("{kw:.1} kW"))
-                .unwrap_or_else(|| "—".into());
-            let energy = live
-                .total_energy_kwh()
-                .map(|v| format!("{v:.1} kWh"))
-                .unwrap_or_else(|| "—".into());
-            let range_added = live
-                .range_added_miles()
-                .map(|v| format!("{v:.0} mi"))
-                .unwrap_or_else(|| "—".into());
-            let efficiency = live
-                .efficiency_mi_per_kwh()
-                .map(|v| format!("{v:.2} mi/kWh"))
-                .unwrap_or_else(|| "—".into());
-            let remaining = live
-                .time_remaining_min()
-                .map(|m| {
-                    let m = m as u64;
-                    if m >= 60 {
-                        format!("{}h {}m", m / 60, m % 60)
-                    } else {
-                        format!("{m}m")
-                    }
-                })
-                .unwrap_or_else(|| "—".into());
-            let charger = live.charger_id.clone().unwrap_or_else(|| "unknown".into());
+            let live = LiveChargeView::from(live);
 
             vec![
-                kv(W, "Power", &power, Color::Green),
+                kv(W, "Power", &live.power_kw, Color::Green),
                 kvw(
                     W,
                     "SOC",
@@ -910,10 +881,14 @@ fn draw_charge_insights(
                         vs.range_miles().unwrap_or_default()
                     ),
                 ),
-                kvw(W, "Added", &format!("{energy} · {range_added}")),
-                kvw(W, "Effcy", &efficiency),
-                kvw(W, "Time", &remaining),
-                kvw(W, "Charger", &charger),
+                kvw(
+                    W,
+                    "Added",
+                    &format!("{} / {}", live.energy_delivered_kwh, live.range_added_miles),
+                ),
+                kvw(W, "mi/kWh", &live.session_efficiency),
+                kvw(W, "Time", &live.time_remaining),
+                kvw(W, "Charger", &live.charger_id),
             ]
         } else {
             let (battery_delta, range_delta, _, _) = trend_delta(app);
@@ -951,38 +926,48 @@ fn draw_charge_insights(
                 ),
             ]
         }
-    } else if let Some(session) = &app.last_charge_session {
-        let efficiency = match (session.range_added_km, session.total_energy_kwh) {
-            (Some(km), Some(kwh)) if kwh > 0.0 && km > 0.0 => {
-                format!("{:.1} mi/kWh", (km / 1.60934) / kwh)
-            }
-            _ => "—".into(),
-        };
-        vec![
-            kvw(W, "When", &format_charge_time(session)),
+    } else if let Some(stats) = &app.charging_stats {
+        let stats = ChargingStatsView::from(stats);
+        let mut rows = vec![
+            kvw(W, "Avg", &stats.avg_mi_per_kwh),
             kvw(
                 W,
-                "Energy",
-                &session
-                    .total_energy_kwh
-                    .map(|value| format!("{value:.1} kWh"))
-                    .unwrap_or_else(|| "—".into()),
+                "Sessions",
+                &format!("{} / {}", stats.session_count, stats.total_energy_kwh),
             ),
             kvw(
                 W,
-                "Range",
-                &session
-                    .range_added_km
-                    .map(|value| format!("{:.0} mi", value / 1.60934))
-                    .unwrap_or_else(|| "—".into()),
+                "Best/Wrst",
+                &format!("{} / {}", stats.best_mi_per_kwh, stats.worst_mi_per_kwh),
             ),
-            kvw(W, "Effcy", &efficiency),
-            kvw(
+            kvw(W, "Home", &stats.home_summary),
+            kvw(W, "Public", &stats.public_summary),
+        ];
+        if let Some(session) = &app.last_charge_session {
+            let session = ChargeInsightView::from(session);
+            // Two rows for the latest session so where it happened isn't lost
+            // to the lifetime stats: compact time + efficiency, then site.
+            rows.push(kvw(
+                W,
+                "Last",
+                &format!("{} · {}", session.when_short, session.efficiency_mi_per_kwh),
+            ));
+            rows.push(kvw(
                 W,
                 "Site",
-                &session.vendor.clone().unwrap_or_else(|| "unknown".into()),
-            ),
-            kvw(W, "Type", &format_charge_kind(session)),
+                &format!("{} ({})", session.location, session.charger_type),
+            ));
+        }
+        rows
+    } else if let Some(session) = &app.last_charge_session {
+        let session = ChargeInsightView::from(session);
+        vec![
+            kvw(W, "When", &session.when),
+            kvw(W, "Energy", &session.energy_kwh),
+            kvw(W, "Range", &session.range_added_miles),
+            kvw(W, "mi/kWh", &session.efficiency_mi_per_kwh),
+            kvw(W, "Site", &session.location),
+            kvw(W, "Type", &session.charger_type),
         ]
     } else {
         vec![

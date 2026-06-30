@@ -8,6 +8,15 @@ use tokio::sync::mpsc;
 
 use super::types::GraphQlResponse;
 
+fn build_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .gzip(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")
+}
+
 /// Base URLs for Rivian's GraphQL endpoints
 pub const GATEWAY_URL: &str = "https://rivian.com/api/gql/gateway/graphql";
 /// Vehicle state and other authenticated queries go through the same gateway
@@ -42,17 +51,29 @@ pub struct RivianClient {
 
 impl RivianClient {
     pub fn new() -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .gzip(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("failed to build HTTP client")?;
         Ok(Self {
-            http,
+            http: build_http_client()?,
             debug: false,
             log_tx: None,
         })
+    }
+
+    /// Wrap an existing reqwest::Client. Used by the app to share a single
+    /// connection pool across all spawned requests instead of building a
+    /// fresh client (and a fresh pool) per task.
+    pub fn from_http(http: reqwest::Client) -> Self {
+        Self {
+            http,
+            debug: false,
+            log_tx: None,
+        }
+    }
+
+    /// Build a reqwest::Client configured the way Rivian's API expects
+    /// (gzip, generous timeouts). Exposed so the app can construct one
+    /// shared client and clone it cheaply into per-request `RivianClient`s.
+    pub fn build_http() -> Result<reqwest::Client> {
+        build_http_client()
     }
 
     /// Enable debug mode (logs full request/response bodies)
@@ -112,11 +133,15 @@ impl RivianClient {
     }
 
     fn redact_secret_str(value: &str) -> String {
-        if value.len() <= 8 {
-            "<redacted>".into()
-        } else {
-            format!("{}...{}", &value[..4], &value[value.len() - 4..])
+        // Slice by chars, not bytes — multi-byte values would otherwise panic
+        // on a string-boundary error.
+        let chars: Vec<char> = value.chars().collect();
+        if chars.len() <= 8 {
+            return "<redacted>".into();
         }
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}...{tail}")
     }
 
     fn is_sensitive_key(key: &str) -> bool {
@@ -248,7 +273,14 @@ impl RivianClient {
         });
 
         if !status.is_success() {
-            bail!("HTTP {status}: {text}");
+            // Redact the response body before surfacing it as an error — it
+            // can flow into the activity log and (for JSON bodies) may echo
+            // sensitive request fields back to the caller.
+            let body = match serde_json::from_str::<Value>(&text) {
+                Ok(_) => Self::redact_json_text(&text),
+                Err(_) => text.chars().take(256).collect::<String>(),
+            };
+            bail!("HTTP {status}: {body}");
         }
 
         let gql_resp: GraphQlResponse<Value> = serde_json::from_str(&text)

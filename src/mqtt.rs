@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::api::types::{ChargingSession, VehicleStateFields};
+use crate::app::{AppEvent, LogEntry, LogLevel};
 use crate::config::MqttConfig;
 
 #[derive(Clone)]
@@ -33,7 +34,11 @@ struct ObservationEnvelope<'a, T> {
 }
 
 impl MqttPublisher {
-    pub fn start(config: MqttConfig) -> Result<Self> {
+    /// Start the MQTT publisher. `event_tx` is the app's event channel; the
+    /// publisher uses it to surface broker/publish errors as activity-log
+    /// entries instead of writing to stderr, which would otherwise mangle
+    /// the ratatui alternate-screen display.
+    pub fn start(config: MqttConfig, event_tx: mpsc::UnboundedSender<AppEvent>) -> Result<Self> {
         let mut options = MqttOptions::new(config.client_id(), config.host.clone(), config.port);
         options.set_keep_alive(Duration::from_secs(config.keep_alive_secs.into()));
         if let Some(username) = config.username.clone() {
@@ -44,20 +49,61 @@ impl MqttPublisher {
         let (tx, mut rx) = mpsc::unbounded_channel::<PublishRequest>();
 
         let eventloop_config = config.clone();
+        let eventloop_log_tx = event_tx.clone();
         tokio::spawn(async move {
+            // An unreachable broker fails poll() immediately, so without
+            // backoff this loop would push an error into the activity log
+            // about once per second — flooding out all other history within
+            // minutes. Back off exponentially and log only the first failure
+            // of a streak (with a periodic "still failing" reminder).
+            const MAX_BACKOFF_SECS: u64 = 60;
+            const REMIND_EVERY: u64 = 50;
+            let mut consecutive_failures: u64 = 0;
             loop {
-                if let Err(err) = eventloop.poll().await {
-                    eprintln!(
-                        "MQTT event loop error for {}: {err}",
-                        eventloop_config.broker_label()
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                match eventloop.poll().await {
+                    Ok(_) => {
+                        if consecutive_failures > 0 {
+                            let _ = eventloop_log_tx.send(AppEvent::ServiceLog(LogEntry {
+                                timestamp: Local::now(),
+                                level: LogLevel::Info,
+                                message: format!(
+                                    "MQTT reconnected to {} after {consecutive_failures} failed attempt(s)",
+                                    eventloop_config.broker_label()
+                                ),
+                                detail: None,
+                            }));
+                        }
+                        consecutive_failures = 0;
+                    }
+                    Err(err) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures == 1
+                            || consecutive_failures.is_multiple_of(REMIND_EVERY)
+                        {
+                            let _ = eventloop_log_tx.send(AppEvent::ServiceLog(LogEntry {
+                                timestamp: Local::now(),
+                                level: LogLevel::Error,
+                                message: format!(
+                                    "MQTT event loop error for {} ({} consecutive): {err}",
+                                    eventloop_config.broker_label(),
+                                    consecutive_failures
+                                ),
+                                detail: None,
+                            }));
+                        }
+                        let backoff = 1u64
+                            .checked_shl(consecutive_failures.min(6) as u32)
+                            .unwrap_or(MAX_BACKOFF_SECS)
+                            .min(MAX_BACKOFF_SECS);
+                        tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    }
                 }
             }
         });
 
         let publish_client = client.clone();
         let publish_config = config.clone();
+        let publish_log_tx = event_tx;
         tokio::spawn(async move {
             while let Some(request) = rx.recv().await {
                 if let Err(err) = publish_client
@@ -69,10 +115,15 @@ impl MqttPublisher {
                     )
                     .await
                 {
-                    eprintln!(
-                        "MQTT publish error for {}: {err}",
-                        publish_config.broker_label()
-                    );
+                    let _ = publish_log_tx.send(AppEvent::ServiceLog(LogEntry {
+                        timestamp: Local::now(),
+                        level: LogLevel::Error,
+                        message: format!(
+                            "MQTT publish error for {}: {err}",
+                            publish_config.broker_label()
+                        ),
+                        detail: None,
+                    }));
                 }
             }
         });

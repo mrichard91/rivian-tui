@@ -9,6 +9,11 @@ pub struct AuthTokens {
     pub csrf_token: String,
     pub app_session_token: String,
     pub vehicle_id: String,
+    /// Stable per-install client id sent in the `Dc-Cid` header. Optional
+    /// so older saved-token payloads still deserialize; backfilled to a
+    /// fresh UUID on the next `load_tokens`.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 /// Temporary MFA state during login
@@ -18,6 +23,10 @@ pub struct MfaState {
     pub csrf_token: String,
     pub app_session_token: String,
     pub otp_token: String,
+    /// Client id chosen at the start of the login flow; carried through the
+    /// OTP exchange so every request in this login uses the same `Dc-Cid`.
+    #[serde(default)]
+    pub device_id: String,
     pub timestamp: i64,
 }
 
@@ -247,7 +256,7 @@ impl LiveChargingSession {
     }
 
     pub fn range_added_miles(&self) -> Option<f64> {
-        self.range_added_km().map(|km| km / 1.60934)
+        self.range_added_km().map(|km| km / KM_PER_MI)
     }
 
     /// mi/kWh observed so far in this session. Returns None until both range
@@ -433,6 +442,13 @@ pub fn celsius_to_fahrenheit(c: f64) -> f64 {
     c * 9.0 / 5.0 + 32.0
 }
 
+/// Kilometers per statute mile. Single source of truth — the TUI, web view,
+/// trip segmenter, and SQL aggregates must all divide by the same value or
+/// their distances/efficiencies silently disagree.
+pub const KM_PER_MI: f64 = 1.60934;
+/// Meters per statute mile.
+pub const METERS_PER_MI: f64 = 1609.344;
+
 impl VehicleStateFields {
     pub fn get_f64(&self, field: &Option<StateValue>) -> Option<f64> {
         field.as_ref().and_then(|v| v.as_f64())
@@ -463,12 +479,14 @@ impl VehicleStateFields {
 
     /// distanceToEmpty is in km from the API
     pub fn range_miles(&self) -> Option<f64> {
-        self.get_f64(&self.distance_to_empty).map(|km| km / 1.60934)
+        self.get_f64(&self.distance_to_empty)
+            .map(|km| km / KM_PER_MI)
     }
 
     /// vehicleMileage is in meters from the API
     pub fn mileage(&self) -> Option<f64> {
-        self.get_f64(&self.vehicle_mileage).map(|m| m / 1609.344)
+        self.get_f64(&self.vehicle_mileage)
+            .map(|m| m / METERS_PER_MI)
     }
 
     pub fn cabin_temp_f(&self) -> Option<f64> {
@@ -482,7 +500,7 @@ impl VehicleStateFields {
     }
 
     pub fn speed_mph(&self) -> Option<f64> {
-        self.get_f64(&self.gnss_speed).map(|kmh| kmh / 1.60934)
+        self.get_f64(&self.gnss_speed).map(|kmh| kmh / KM_PER_MI)
     }
 
     pub fn altitude_ft(&self) -> Option<f64> {
@@ -581,6 +599,16 @@ impl VehicleStateFields {
         }
 
         None
+    }
+
+    /// True when an OTA update is available — i.e. the API reports a
+    /// distinct, non-sentinel `otaAvailableVersion`. Centralised so the TUI
+    /// and web view can't drift apart on which sentinel values mean
+    /// "nothing to install".
+    pub fn update_available(&self) -> bool {
+        let avail = self.get_str(&self.ota_available_version);
+        let current = self.get_str(&self.ota_current_version);
+        !matches!(avail, "" | "—" | "0.0.0" | "unknown") && avail != current
     }
 
     pub fn is_actively_charging(&self) -> bool {
@@ -992,11 +1020,29 @@ mod tests {
             csrf_token: "csrf".into(),
             app_session_token: "ast".into(),
             vehicle_id: "vid".into(),
+            device_id: Some("device-1".into()),
         };
         let json = serde_json::to_string(&tokens).unwrap();
         let parsed: AuthTokens = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.access_token, "at");
         assert_eq!(parsed.vehicle_id, "vid");
+        assert_eq!(parsed.device_id.as_deref(), Some("device-1"));
+    }
+
+    #[test]
+    fn auth_tokens_deserialize_legacy_payload_without_device_id() {
+        // Older saved payloads predate `device_id`; they must still parse.
+        let legacy = r#"{
+            "access_token": "at",
+            "refresh_token": "rt",
+            "user_session_token": "ust",
+            "csrf_token": "csrf",
+            "app_session_token": "ast",
+            "vehicle_id": "vid"
+        }"#;
+        let parsed: AuthTokens = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.vehicle_id, "vid");
+        assert!(parsed.device_id.is_none());
     }
 
     #[test]
@@ -1006,6 +1052,7 @@ mod tests {
             csrf_token: "csrf".into(),
             app_session_token: "ast".into(),
             otp_token: "otp".into(),
+            device_id: "device-1".into(),
             timestamp: 1710000000,
         };
         let json = serde_json::to_string(&mfa).unwrap();

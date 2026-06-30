@@ -49,6 +49,7 @@ pub struct PendingVehicleSelection {
     pub user_session_token: String,
     pub csrf_token: String,
     pub app_session_token: String,
+    pub device_id: String,
     pub vehicles: Vec<Vehicle>,
 }
 
@@ -61,8 +62,15 @@ impl PendingVehicleSelection {
             csrf_token: self.csrf_token,
             app_session_token: self.app_session_token,
             vehicle_id,
+            device_id: Some(self.device_id),
         }
     }
+}
+
+/// Build a Rivian-style client id (`m-ios-<uuid>`). Generated once per
+/// install and persisted alongside the auth tokens.
+fn new_device_id() -> String {
+    format!("m-ios-{}", uuid::Uuid::new_v4())
 }
 
 /// Build the authenticated session headers used for saved-session API calls.
@@ -71,11 +79,15 @@ impl PendingVehicleSelection {
 /// remain valid, so dashboard polling should rely on the session headers instead
 /// of sending a potentially stale bearer token.
 pub fn authenticated_headers(tokens: &AuthTokens) -> Vec<(&'static str, String)> {
+    // Prefer the persisted device id; older saved-token payloads may not
+    // have one yet, in which case fall back to a fresh UUID (load_tokens
+    // backfills and re-saves on the next launch).
+    let device_id = tokens.device_id.clone().unwrap_or_else(new_device_id);
     vec![
         ("Csrf-Token", tokens.csrf_token.clone()),
         ("A-Sess", tokens.app_session_token.clone()),
         ("U-Sess", tokens.user_session_token.clone()),
-        ("Dc-Cid", format!("m-ios-{}", uuid::Uuid::new_v4())),
+        ("Dc-Cid", device_id),
     ]
 }
 
@@ -180,15 +192,31 @@ impl AuthManager {
 
     pub fn load_tokens() -> Result<Option<AuthTokens>> {
         let mut keyring_error = None;
-        match Self::load_tokens_from_keyring() {
-            Ok(Some(tokens)) => return Ok(Some(tokens)),
-            Ok(None) => {}
-            Err(e) => keyring_error = Some(e),
+        let mut tokens = match Self::load_tokens_from_keyring() {
+            Ok(Some(tokens)) => Some(tokens),
+            Ok(None) => None,
+            Err(e) => {
+                keyring_error = Some(e);
+                None
+            }
+        };
+
+        if tokens.is_none() {
+            if let Some(legacy) = Self::load_legacy_tokens()? {
+                let _ = Self::save_tokens_to_keyring(&legacy);
+                tokens = Some(legacy);
+            }
         }
 
-        if let Some(tokens) = Self::load_legacy_tokens()? {
-            let _ = Self::save_tokens_to_keyring(&tokens);
-            return Ok(Some(tokens));
+        if let Some(t) = tokens.as_mut() {
+            // Backfill the per-install device id on first load with the new
+            // code, so older saved tokens stop generating a fresh UUID on
+            // every authenticated request.
+            if t.device_id.as_deref().map(str::is_empty).unwrap_or(true) {
+                t.device_id = Some(new_device_id());
+                let _ = Self::save_tokens(t);
+            }
+            return Ok(tokens);
         }
 
         if let Some(err) = keyring_error {
@@ -221,8 +249,12 @@ impl AuthManager {
         };
         let legacy_result = Self::clear_legacy_token_file();
 
+        // Both stores must clear successfully — if either still holds the
+        // credential, the next `load_tokens` will resurrect it and silently
+        // re-authenticate the user after logout.
         match (keyring_result, legacy_result) {
-            (Ok(()), Ok(())) | (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
             (Err(keyring_err), Err(legacy_err)) => Err(anyhow!(
                 "failed to clear both keychain and legacy token file: {keyring_err}; {legacy_err}"
             )),
@@ -251,11 +283,11 @@ impl AuthManager {
     pub async fn login(&self, email: &str, password: &str) -> Result<LoginOutcome> {
         let csrf = self.get_csrf_token().await?;
 
-        let client_id = format!("m-ios-{}", uuid::Uuid::new_v4());
+        let device_id = new_device_id();
         let headers = vec![
             ("Csrf-Token", csrf.csrf_token.clone()),
             ("A-Sess", csrf.app_session_token.clone()),
-            ("Dc-Cid", client_id),
+            ("Dc-Cid", device_id.clone()),
         ];
 
         let vars = json!({
@@ -285,6 +317,7 @@ impl AuthManager {
                 csrf_token: csrf.csrf_token,
                 app_session_token: csrf.app_session_token,
                 otp_token,
+                device_id,
                 timestamp: chrono::Utc::now().timestamp(),
             };
             return Ok(LoginOutcome::MfaRequired(mfa));
@@ -302,16 +335,16 @@ impl AuthManager {
             &user_session_token,
             &csrf.csrf_token,
             &csrf.app_session_token,
+            &device_id,
         )
         .await
     }
 
     pub async fn complete_mfa(&self, mfa: &MfaState, otp_code: &str) -> Result<LoginOutcome> {
-        let client_id = format!("m-ios-{}", uuid::Uuid::new_v4());
         let headers = vec![
             ("Csrf-Token", mfa.csrf_token.clone()),
             ("A-Sess", mfa.app_session_token.clone()),
-            ("Dc-Cid", client_id),
+            ("Dc-Cid", mfa.device_id.clone()),
         ];
 
         let vars = json!({
@@ -340,6 +373,7 @@ impl AuthManager {
             &r.user_session_token,
             &mfa.csrf_token,
             &mfa.app_session_token,
+            &mfa.device_id,
         )
         .await
     }
@@ -351,13 +385,13 @@ impl AuthManager {
         user_session_token: &str,
         csrf_token: &str,
         app_session_token: &str,
+        device_id: &str,
     ) -> Result<LoginOutcome> {
-        let client_id = format!("m-ios-{}", uuid::Uuid::new_v4());
         let headers = vec![
             ("Csrf-Token", csrf_token.to_string()),
             ("A-Sess", app_session_token.to_string()),
             ("U-Sess", user_session_token.to_string()),
-            ("Dc-Cid", client_id),
+            ("Dc-Cid", device_id.to_string()),
         ];
 
         let data: UserInfoData = self
@@ -384,6 +418,7 @@ impl AuthManager {
                     user_session_token: user_session_token.to_string(),
                     csrf_token: csrf_token.to_string(),
                     app_session_token: app_session_token.to_string(),
+                    device_id: device_id.to_string(),
                     vehicles: data.current_user.vehicles,
                 },
             ));
@@ -398,6 +433,7 @@ impl AuthManager {
             csrf_token: csrf_token.to_string(),
             app_session_token: app_session_token.to_string(),
             vehicle_id,
+            device_id: Some(device_id.to_string()),
         };
 
         Self::save_tokens(&tokens)?;
@@ -477,6 +513,7 @@ mod tests {
             user_session_token: "test-ust".into(),
             csrf_token: "test-csrf".into(),
             app_session_token: "test-ast".into(),
+            device_id: "test-device".into(),
             vehicles: vec![Vehicle {
                 id: "test-vid".into(),
                 name: Some("My Rivian".into()),
@@ -486,6 +523,7 @@ mod tests {
         let tokens = pending.into_tokens("test-vid".into());
         assert_eq!(tokens.access_token, "test-at");
         assert_eq!(tokens.vehicle_id, "test-vid");
+        assert_eq!(tokens.device_id.as_deref(), Some("test-device"));
     }
 
     #[test]
@@ -497,6 +535,7 @@ mod tests {
             csrf_token: "test-csrf".into(),
             app_session_token: "test-ast".into(),
             vehicle_id: "test-vid".into(),
+            device_id: Some("test-device".into()),
         });
 
         assert!(headers.iter().any(|(k, _)| *k == "Csrf-Token"));
@@ -516,6 +555,7 @@ mod tests {
             csrf_token: "test-csrf".into(),
             app_session_token: "test-ast".into(),
             vehicle_id: "test-vid".into(),
+            device_id: Some("test-device".into()),
         };
 
         let json_str = serde_json::to_string(&tokens).unwrap();
@@ -549,6 +589,7 @@ mod tests {
             csrf_token: "test-csrf".into(),
             app_session_token: "test-ast".into(),
             vehicle_id: "test-vid".into(),
+            device_id: Some("test-device".into()),
         };
 
         AuthManager::save_tokens(&tokens).unwrap();
