@@ -5,7 +5,7 @@ use crate::api::types::{KM_PER_MI, METERS_PER_MI};
 use crate::app::{App, LogLevel, LoginField, Mode};
 use crate::view_model::{
     humanize_iso_local, AlertSeverity, AlertsView, ChargeInsightView, ChargingStatsView,
-    LiveChargeView, TripView,
+    LiveChargeHistoryView, LiveChargeView, SoftwareView, TripView, VehicleMetadataView,
 };
 
 /// Render a label:value line with the label padded to `w` chars
@@ -152,10 +152,11 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let status_icon = if connected { "●" } else { "○" };
     let status_color = if connected { Color::Green } else { Color::Red };
 
-    let vehicle_id = app
-        .tokens
+    let vehicle_label = app
+        .vehicle_metadata
         .as_ref()
-        .map(|t| t.vehicle_id.as_str())
+        .map(|meta| meta.display_name.as_str())
+        .or_else(|| app.tokens.as_ref().map(|t| t.vehicle_id.as_str()))
         .unwrap_or("not connected");
 
     let mut spans = vec![
@@ -168,7 +169,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" "),
         Span::styled(status_icon, Style::default().fg(status_color)),
-        Span::raw(format!(" Vehicle: {vehicle_id}")),
+        Span::raw(format!(" Vehicle: {vehicle_label}")),
     ];
 
     if app.debug {
@@ -203,17 +204,49 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     let Some(vs) = &app.vehicle_state else {
-        let msg = if app.tokens.is_some() {
-            "Fetching vehicle data..."
+        let (title, border_color, lines) = if let Some(error) = &app.vehicle_state_error {
+            let summary = error
+                .lines()
+                .next()
+                .unwrap_or("Vehicle-state request failed");
+            (
+                " Dashboard error ",
+                Color::Red,
+                vec![
+                    Line::from(Span::styled(
+                        "Unable to load vehicle data",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(summary),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Press r to retry or l to open the activity log",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ],
+            )
+        } else if app.tokens.is_some() {
+            (
+                " Dashboard ",
+                Color::DarkGray,
+                vec![Line::from("Fetching vehicle data...")],
+            )
         } else {
-            "Not connected"
+            (
+                " Dashboard ",
+                Color::DarkGray,
+                vec![Line::from("Not connected")],
+            )
         };
-        let waiting = Paragraph::new(msg).alignment(Alignment::Center).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Dashboard "),
-        );
+        let waiting = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color))
+                    .title(title),
+            );
         frame.render_widget(waiting, area);
         return;
     };
@@ -221,7 +254,15 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     let alerts = AlertsView::from_state(vs);
     let mut body_constraints = Vec::new();
     if !alerts.items.is_empty() {
-        body_constraints.push(Constraint::Length(3));
+        let content_width = area.width.saturating_sub(4).max(1) as usize;
+        let content_len = alerts
+            .items
+            .iter()
+            .map(|alert| alert.message.len() + 3)
+            .sum::<usize>()
+            + alerts.data_age.as_ref().map_or(8, |age| age.len() + 15);
+        let wrapped_lines = content_len.div_ceil(content_width).clamp(1, 3);
+        body_constraints.push(Constraint::Length(wrapped_lines as u16 + 2));
     }
     body_constraints.push(Constraint::Min(12));
     body_constraints.push(Constraint::Length(9));
@@ -242,8 +283,8 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App) {
     .split(sections[section_idx]);
 
     draw_col_battery(frame, cols[0], vs);
-    draw_col_vehicle(frame, cols[1], vs);
-    draw_col_status(frame, cols[2], vs);
+    draw_col_vehicle(frame, cols[1], app, vs);
+    draw_col_status(frame, cols[2], app, vs);
 
     let insights = Layout::horizontal([
         Constraint::Percentage(40),
@@ -332,7 +373,12 @@ fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
 }
 
 /// Middle column: vehicle info
-fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::VehicleStateFields) {
+fn draw_col_vehicle(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    vs: &crate::api::types::VehicleStateFields,
+) {
     const VW: usize = 10;
     let show_art = area.width >= 30 && area.height >= 16;
     let sections = if show_art {
@@ -394,7 +440,20 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
     };
     let defrost_color = status_color(defrost);
 
-    let lines = vec![
+    let metadata = app.vehicle_metadata.as_ref().map(VehicleMetadataView::from);
+    let mut lines = Vec::new();
+    if let Some(meta) = &metadata {
+        lines.push(kvw(VW, "Name", &meta.display_name));
+        lines.push(kvw(VW, "Model", &meta.model));
+        if meta.trim != "—" {
+            lines.push(kvw(VW, "Trim", &meta.trim));
+        }
+        if meta.exterior_color != "—" {
+            lines.push(kvw(VW, "Color", &meta.exterior_color));
+        }
+    }
+
+    lines.extend([
         kv(VW, "Power", power, power_color),
         kvw(VW, "Gear", vs.gear_str()),
         kvw(VW, "Mode", vs.drive_mode_str()),
@@ -407,7 +466,7 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
         kvw(VW, "Vent", &format!("{vent_fl}/{vent_fr}")),
         kvw(VW, "Wheel", sw_heat),
         kv(VW, "Cold", &cold_str, cold_color),
-    ];
+    ]);
 
     if show_art {
         let art: Vec<Line> = R1T_ART
@@ -427,7 +486,12 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan))
-                    .title(" R1T "),
+                    .title(
+                        metadata
+                            .as_ref()
+                            .map(|meta| format!(" {} ", meta.model))
+                            .unwrap_or_else(|| " R1T ".into()),
+                    ),
             ),
             sections[0],
         );
@@ -443,7 +507,12 @@ fn draw_col_vehicle(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
 }
 
 /// Right column: doors, tires, OTA, status
-fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::VehicleStateFields) {
+fn draw_col_status(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    vs: &crate::api::types::VehicleStateFields,
+) {
     let rows = Layout::vertical([
         Constraint::Length(9), // access
         Constraint::Min(11),   // system
@@ -536,6 +605,7 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     );
 
     // --- System ---
+    let sw = SoftwareView::from_state(vs);
     let current = vs.get_str(&vs.ota_current_version);
     let available = vs.get_str(&vs.ota_available_version);
     let ota_status = vs.get_str(&vs.ota_status);
@@ -563,12 +633,39 @@ fn draw_col_status(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehicl
     };
     let avail_str = if has_update { available } else { "up to date" };
 
+    let notes = app
+        .ota_update_details
+        .as_ref()
+        .map(|details| {
+            if details
+                .available
+                .as_ref()
+                .and_then(|d| d.url.as_ref())
+                .is_some()
+            {
+                ("Avail", Color::Yellow)
+            } else if details
+                .current
+                .as_ref()
+                .and_then(|d| d.url.as_ref())
+                .is_some()
+            {
+                ("Current", Color::Green)
+            } else {
+                ("—", Color::DarkGray)
+            }
+        })
+        .unwrap_or(("—", Color::DarkGray));
+
     let system_lines = vec![
         kvw(RW, "Current", current),
+        kvw(RW, "Build", &sw.current_version_number),
         kv(RW, "Avail", avail_str, avail_color),
+        kvw(RW, "AvBuild", &sw.available_version_number),
         kv(RW, "OTA", ota_status, status_color(ota_status)),
         kvw(RW, "Prog", &progress),
         kvw(RW, "Ready", install_ready),
+        kv(RW, "Notes", notes.0, notes.1),
         kvw(RW, "Sync", &last_sync),
         kvw(RW, "Loc", &location),
         kvw(RW, "Head", &heading),
@@ -674,13 +771,78 @@ fn trend_delta(app: &App) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>
     (battery, range, mileage, peak_speed)
 }
 
-fn sparkline_data(values: impl Iterator<Item = Option<f64>>, scale: f64) -> Vec<u64> {
+fn sparkline_data(values: impl Iterator<Item = Option<f64>>) -> Vec<u64> {
     // Drop missing samples rather than rendering them as zero, which would
     // otherwise pull the line to the baseline and misrepresent the trend.
+    let values: Vec<f64> = values.flatten().collect();
+    if values.is_empty() {
+        return Vec::new();
+    }
+
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = max - min;
+    if span < f64::EPSILON {
+        return vec![1; values.len()];
+    }
+
     values
-        .flatten()
-        .map(|value| (value.max(0.0) * scale) as u64)
+        .into_iter()
+        .map(|value| (((value - min) / span) * 100.0).round() as u64)
         .collect()
+}
+
+fn trend_range(values: impl Iterator<Item = Option<f64>>) -> Option<(f64, f64)> {
+    values.flatten().fold(None, |acc, value| match acc {
+        Some((min, max)) => Some((f64::min(min, value), f64::max(max, value))),
+        None => Some((value, value)),
+    })
+}
+
+fn signed_value(value: Option<f64>, unit: &str, decimals: usize) -> String {
+    value
+        .map(|v| format!("{v:+.*}{unit}", decimals))
+        .unwrap_or_else(|| format!("—{unit}"))
+}
+
+fn trend_summary(
+    charging: bool,
+    battery_delta: Option<f64>,
+    range_delta: Option<f64>,
+    mileage_delta: Option<f64>,
+    speed_mph: f64,
+) -> (String, Color) {
+    if charging {
+        return (
+            format!(
+                "charging: SOC {}  range {}",
+                signed_value(battery_delta, "%", 1),
+                signed_value(range_delta, "mi", 0),
+            ),
+            Color::Green,
+        );
+    }
+
+    if mileage_delta.unwrap_or_default().abs() >= 0.1 {
+        return (
+            format!(
+                "drove {}  SOC {}  range {}",
+                signed_value(mileage_delta, "mi", 1),
+                signed_value(battery_delta, "%", 1),
+                signed_value(range_delta, "mi", 0),
+            ),
+            Color::White,
+        );
+    }
+
+    if speed_mph >= 1.0 {
+        return (format!("moving now at {speed_mph:.0} mph"), Color::Yellow);
+    }
+
+    (
+        format!("parked: SOC {}", signed_value(battery_delta, "%", 1)),
+        Color::DarkGray,
+    )
 }
 
 fn draw_trend_panel(
@@ -707,78 +869,85 @@ fn draw_trend_panel(
 
     let rows = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inner);
 
-    // Compact labels: this panel is 40% of the body, so the line must
-    // survive ~30 columns on an 80-col terminal without losing the deltas.
     let (battery_delta, range_delta, mileage_delta, peak_speed) = trend_delta(app);
-    let summary = format!(
-        " {}sn ΔSOC{:+.1}% ΔRng{:+.0} ΔODO{:+.0}mi",
-        app.recent_trend.len(),
-        battery_delta.unwrap_or_default(),
-        range_delta.unwrap_or_default(),
-        mileage_delta.unwrap_or_default(),
+    let now_speed = vs.speed_mph().unwrap_or_default();
+    let (summary, summary_color) = trend_summary(
+        vs.is_actively_charging(),
+        battery_delta,
+        range_delta,
+        mileage_delta,
+        now_speed,
     );
     frame.render_widget(
-        Paragraph::new(summary).style(Style::default().fg(Color::White)),
+        Paragraph::new(format!(
+            " 24h / {} samples · {summary}",
+            app.recent_trend.len()
+        ))
+        .style(Style::default().fg(summary_color)),
         rows[0],
     );
 
-    let battery_data = sparkline_data(
-        app.recent_trend.iter().map(|point| point.battery_level),
-        10.0,
-    );
-    let range_data = sparkline_data(app.recent_trend.iter().map(|point| point.range_km), 1.0);
+    let battery_data = sparkline_data(app.recent_trend.iter().map(|point| point.battery_level));
+    let range_data = sparkline_data(app.recent_trend.iter().map(|point| point.range_km));
+    let battery_band = trend_range(app.recent_trend.iter().map(|point| point.battery_level))
+        .map(|(min, max)| format!("{min:.0}-{max:.0}%"))
+        .unwrap_or_else(|| "—".into());
+    let range_band = trend_range(
+        app.recent_trend
+            .iter()
+            .map(|point| point.range_km.map(|km| km / KM_PER_MI)),
+    )
+    .map(|(min, max)| format!("{min:.0}-{max:.0}mi"))
+    .unwrap_or_else(|| "—".into());
 
     frame.render_widget(
-        Sparkline::default()
-            .block(Block::default().title(" SOC "))
-            .data(&battery_data)
-            .style(Style::default().fg(Color::Green)),
+        Paragraph::new(format!(
+            " SOC   {:>3.0}%  {}  band {battery_band}",
+            vs.battery_percent().unwrap_or_default(),
+            signed_value(battery_delta, "%", 1),
+        ))
+        .style(Style::default().fg(Color::Green)),
         rows[1],
     );
     frame.render_widget(
         Sparkline::default()
-            .block(Block::default().title(" Range km "))
-            .data(&range_data)
-            .style(Style::default().fg(Color::Yellow)),
+            .data(&battery_data)
+            .style(Style::default().fg(Color::Green)),
         rows[2],
     );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " Range {:>3.0}mi  {}  band {range_band}",
+            vs.range_miles().unwrap_or_default(),
+            signed_value(range_delta, "mi", 0),
+        ))
+        .style(Style::default().fg(Color::Yellow)),
+        rows[3],
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .data(&range_data)
+            .style(Style::default().fg(Color::Yellow)),
+        rows[4],
+    );
 
-    let motion = if let Some(stats) = &app.charging_stats {
-        // Use the bottom slot to surface the lifetime charging stats since
-        // there's no other home for them in the current layout.
-        let avg = stats
-            .avg_mi_per_kwh
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "—".into());
-        let best = stats
-            .best_mi_per_kwh
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "—".into());
-        let worst = stats
-            .worst_mi_per_kwh
-            .map(|v| format!("{v:.2}"))
-            .unwrap_or_else(|| "—".into());
-        format!(
-            " {}chg {:.0}kWh avg{avg} hi{best} lo{worst}",
-            stats.session_count, stats.total_energy_kwh,
-        )
-    } else {
-        format!(
-            " Now {:.0}mph Peak {:.0}mph Alt {:.0}ft",
-            vs.speed_mph().unwrap_or_default(),
-            peak_speed.unwrap_or_default(),
-            vs.altitude_ft().unwrap_or_default(),
-        )
-    };
+    let motion = format!(
+        " Odo {}  now {:.0}mph  peak {:.0}mph",
+        signed_value(mileage_delta, "mi", 1),
+        now_speed,
+        peak_speed.unwrap_or_default(),
+    );
     frame.render_widget(
         Paragraph::new(motion).style(Style::default().fg(Color::DarkGray)),
-        rows[3],
+        rows[5],
     );
 }
 
@@ -869,6 +1038,14 @@ fn draw_charge_insights(
         // before the first live response arrives.
         if let Some(live) = &app.live_charging_session {
             let live = LiveChargeView::from(live);
+            let history = app
+                .live_charging_history
+                .as_ref()
+                .map(LiveChargeHistoryView::from);
+            let history_line = history
+                .as_ref()
+                .map(|h| format!("avg {} pk {}", h.average_kw, h.peak_kw))
+                .unwrap_or_else(|| "fetching".into());
 
             vec![
                 kv(W, "Power", &live.power_kw, Color::Green),
@@ -888,7 +1065,7 @@ fn draw_charge_insights(
                 ),
                 kvw(W, "mi/kWh", &live.session_efficiency),
                 kvw(W, "Time", &live.time_remaining),
-                kvw(W, "Charger", &live.charger_id),
+                kvw(W, "History", &history_line),
             ]
         } else {
             let (battery_delta, range_delta, _, _) = trend_delta(app);

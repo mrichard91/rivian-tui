@@ -979,6 +979,7 @@ mod tests {
             is_roaming_network: Some(false),
             is_public: Some(false),
             is_home_charger: Some(true),
+            meta: None,
         };
 
         let inserted = db
@@ -1056,6 +1057,7 @@ mod tests {
             is_roaming_network: Some(false),
             is_public: Some(false),
             is_home_charger: Some(true),
+            meta: None,
         };
         let newer = ChargingSession {
             transaction_id: Some("txn-2".into()),
@@ -1073,6 +1075,7 @@ mod tests {
             is_roaming_network: Some(false),
             is_public: Some(true),
             is_home_charger: Some(false),
+            meta: None,
         };
 
         db.upsert_charging_sessions(&[older, newer], "vehicle-1")
@@ -1417,6 +1420,7 @@ mod tests {
             is_roaming_network: Some(false),
             is_public: Some(false),
             is_home_charger: Some(false),
+            meta: None,
         }
     }
 

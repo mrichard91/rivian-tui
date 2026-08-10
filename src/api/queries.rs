@@ -10,7 +10,19 @@ pub const LOGIN: &str = "mutation Login($email: String!, $password: String!) { l
 
 pub const LOGIN_WITH_OTP: &str = "mutation LoginWithOTP($email: String!, $otpCode: String!, $otpToken: String!) { loginWithOTP(email: $email, otpCode: $otpCode, otpToken: $otpToken) { __typename accessToken refreshToken userSessionToken } }";
 
-pub const GET_USER_INFO: &str = "query getUserInfo { currentUser { vehicles { id } } }";
+pub const GET_USER_INFO: &str = "\
+query getUserInfo { currentUser { \
+vehicles { id name owner roles vin state \
+vehicle { id vin model modelYear make otaEarlyAccessStatus \
+mobileConfiguration { \
+trimOption { optionName } exteriorColorOption { optionName } interiorColorOption { optionName } \
+driveSystemOption { optionName } tonneauOption { optionName } wheelOption { optionName } chargePort \
+} \
+vehicleState { supportedFeatures { name status } } \
+} \
+settings { name { value } } \
+} \
+} }";
 
 pub const GET_VEHICLE_STATE: &str = "\
 query GetVehicleState($vehicleID: String!) { vehicleState(id: $vehicleID) { \
@@ -18,6 +30,7 @@ powerState { value } driveMode { value } gearStatus { value } vehicleMileage { v
 batteryLevel { value } distanceToEmpty { value } chargerStatus { value } chargerState { value } \
 batteryLimit { value } timeToEndOfCharge { value } batteryCapacity { value } \
 chargePortState { value } chargerDerateStatus { value } remoteChargingAvailable { value } \
+batteryNeedsLfpCalibration { value } chargingDisabledAll { value } \
 cabinClimateInteriorTemperature { value } cabinClimateDriverTemperature { value } \
 cabinPreconditioningStatus { value } cabinPreconditioningType { value } \
 defrostDefogStatus { value } \
@@ -28,6 +41,8 @@ steeringWheelHeat { value } \
 cloudConnection { lastSync } gnssLocation { latitude longitude timeStamp } \
 gnssSpeed { value } gnssAltitude { value } gnssBearing { value } \
 otaCurrentVersion { value } otaAvailableVersion { value } otaStatus { value } \
+otaCurrentVersionNumber { value } otaAvailableVersionNumber { value } \
+otaCurrentVersionGitHash { value } otaAvailableVersionGitHash { value } \
 otaCurrentStatus { value } otaCurrentVersionWeek { value } otaCurrentVersionYear { value } \
 otaAvailableVersionWeek { value } otaAvailableVersionYear { value } \
 otaDownloadProgress { value } otaInstallProgress { value } otaInstallReady { value } \
@@ -40,16 +55,32 @@ closureFrunkClosed { value } closureFrunkLocked { value } \
 closureLiftgateClosed { value } closureLiftgateLocked { value } \
 closureTailgateClosed { value } closureTailgateLocked { value } \
 closureSideBinLeftClosed { value } closureSideBinRightClosed { value } \
+closureTonneauClosed { value } \
 windowFrontLeftClosed { value } windowFrontRightClosed { value } \
 windowRearLeftClosed { value } windowRearRightClosed { value } \
+windowFrontLeftCalibrated { value } windowFrontRightCalibrated { value } \
+windowRearLeftCalibrated { value } windowRearRightCalibrated { value } \
 tirePressureStatusFrontLeft { value } tirePressureStatusFrontRight { value } \
 tirePressureStatusRearLeft { value } tirePressureStatusRearRight { value } \
+tirePressureStatusValidFrontLeft { value } tirePressureStatusValidFrontRight { value } \
+tirePressureStatusValidRearLeft { value } tirePressureStatusValidRearRight { value } \
 petModeStatus { value } petModeTemperatureStatus { value } \
 gearGuardLocked { value } gearGuardVideoStatus { value } gearGuardVideoMode { value } \
 alarmSoundStatus { value } wiperFluidState { value } \
 limitedAccelCold { value } limitedRegenCold { value } \
 twelveVoltBatteryHealth { value } batteryHvThermalEvent { value } \
+batteryHvThermalEventPropagation { value } brakeFluidLow { value } \
+btmFfHardwareFailureStatus { value } btmIcHardwareFailureStatus { value } \
+btmLfdHardwareFailureStatus { value } btmOcHardwareFailureStatus { value } \
+btmRfdHardwareFailureStatus { value } btmRfHardwareFailureStatus { value } \
 serviceMode { value } trailerStatus { value } carWashMode { value } \
+} }";
+
+pub const GET_OTA_UPDATE_DETAILS: &str = "\
+query getOTAUpdateDetails($vehicleId: String!) { \
+getVehicle(id: $vehicleId) { \
+availableOTAUpdateDetails { url version locale } \
+currentOTAUpdateDetails { url version locale } \
 } }";
 
 /// Charging endpoint — completed session summaries
@@ -78,3 +109,8 @@ timeRemaining { value updatedAt } \
 totalChargedEnergy { value updatedAt } \
 vehicleChargerState { value updatedAt } \
 } }";
+
+pub const GET_LIVE_CHARGING_HISTORY: &str = "\
+query getLiveSessionHistory($vehicleId: ID) { \
+getLiveSessionHistory(vehicleId: $vehicleId) { chartData { kw time } } \
+}";

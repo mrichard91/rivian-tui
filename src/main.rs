@@ -197,6 +197,8 @@ async fn run_tui(
 
     // If we loaded tokens, kick off initial fetches
     if app.tokens.is_some() {
+        app.fetch_vehicle_metadata();
+        app.fetch_ota_details();
         app.poll_vehicle_state();
         app.fetch_charging_history();
     }
@@ -219,6 +221,8 @@ async fn run_tui(
         }
 
         if needs_initial_fetch && app.tokens.is_some() {
+            app.fetch_vehicle_metadata();
+            app.fetch_ota_details();
             app.poll_vehicle_state();
             app.fetch_charging_history();
             last_poll = Instant::now();

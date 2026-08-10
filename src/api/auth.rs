@@ -517,6 +517,12 @@ mod tests {
             vehicles: vec![Vehicle {
                 id: "test-vid".into(),
                 name: Some("My Rivian".into()),
+                owner: None,
+                roles: Vec::new(),
+                vin: None,
+                state: None,
+                vehicle: None,
+                settings: None,
             }],
         };
 

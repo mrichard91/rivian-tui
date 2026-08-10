@@ -125,10 +125,169 @@ pub struct CurrentUser {
     pub vehicles: Vec<Vehicle>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Vehicle {
     pub id: String,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub vin: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub vehicle: Option<VehicleDetails>,
+    #[serde(default)]
+    pub settings: Option<UserVehicleSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VehicleDetails {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub vin: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_year: Option<i64>,
+    #[serde(default)]
+    pub make: Option<String>,
+    #[serde(default)]
+    pub mobile_configuration: Option<MobileConfiguration>,
+    #[serde(default)]
+    pub vehicle_state: Option<VehicleStateSummary>,
+    #[serde(default)]
+    pub ota_early_access_status: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileConfiguration {
+    #[serde(default)]
+    pub trim_option: Option<ConfigOption>,
+    #[serde(default)]
+    pub exterior_color_option: Option<ConfigOption>,
+    #[serde(default)]
+    pub interior_color_option: Option<ConfigOption>,
+    #[serde(default)]
+    pub drive_system_option: Option<ConfigOption>,
+    #[serde(default)]
+    pub tonneau_option: Option<ConfigOption>,
+    #[serde(default)]
+    pub wheel_option: Option<ConfigOption>,
+    #[serde(default)]
+    pub charge_port: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigOption {
+    #[serde(default)]
+    pub option_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VehicleStateSummary {
+    #[serde(default)]
+    pub supported_features: Vec<SupportedFeature>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SupportedFeature {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UserVehicleSettings {
+    #[serde(default)]
+    pub name: Option<SettingsValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SettingsValue {
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VehicleMetadata {
+    pub id: String,
+    pub display_name: String,
+    pub vin: Option<String>,
+    pub model: Option<String>,
+    pub model_year: Option<i64>,
+    pub trim: Option<String>,
+    pub exterior_color: Option<String>,
+    pub interior_color: Option<String>,
+    pub drive_system: Option<String>,
+    pub wheel: Option<String>,
+    pub charge_port: Option<String>,
+    pub roles: Vec<String>,
+    pub state: Option<String>,
+    pub supported_features: Vec<SupportedFeature>,
+    pub ota_early_access_status: Option<bool>,
+}
+
+impl Vehicle {
+    pub fn display_name(&self) -> String {
+        self.settings
+            .as_ref()
+            .and_then(|settings| settings.name.as_ref())
+            .and_then(|name| name.value.as_deref())
+            .filter(|name| !name.is_empty())
+            .or(self.name.as_deref().filter(|name| !name.is_empty()))
+            .or_else(|| {
+                self.vehicle
+                    .as_ref()
+                    .and_then(|vehicle| vehicle.model.as_deref())
+                    .filter(|model| !model.is_empty())
+            })
+            .unwrap_or(&self.id)
+            .to_string()
+    }
+
+    pub fn metadata(&self) -> VehicleMetadata {
+        let details = self.vehicle.as_ref();
+        let config = details.and_then(|vehicle| vehicle.mobile_configuration.as_ref());
+        let option = |field: Option<&ConfigOption>| {
+            field
+                .and_then(|option| option.option_name.clone())
+                .filter(|value| !value.is_empty())
+        };
+
+        VehicleMetadata {
+            id: self.id.clone(),
+            display_name: self.display_name(),
+            vin: details
+                .and_then(|vehicle| vehicle.vin.clone())
+                .or_else(|| self.vin.clone()),
+            model: details.and_then(|vehicle| vehicle.model.clone()),
+            model_year: details.and_then(|vehicle| vehicle.model_year),
+            trim: option(config.and_then(|config| config.trim_option.as_ref())),
+            exterior_color: option(config.and_then(|config| config.exterior_color_option.as_ref())),
+            interior_color: option(config.and_then(|config| config.interior_color_option.as_ref())),
+            drive_system: option(config.and_then(|config| config.drive_system_option.as_ref())),
+            wheel: option(config.and_then(|config| config.wheel_option.as_ref())),
+            charge_port: config.and_then(|config| config.charge_port.clone()),
+            roles: self.roles.clone(),
+            state: self.state.clone(),
+            supported_features: details
+                .and_then(|vehicle| vehicle.vehicle_state.as_ref())
+                .map(|state| state.supported_features.clone())
+                .unwrap_or_default(),
+            ota_early_access_status: details.and_then(|vehicle| vehicle.ota_early_access_status),
+        }
+    }
 }
 
 // --- Charging Sessions ---
@@ -157,6 +316,17 @@ pub struct ChargingSession {
     pub is_roaming_network: Option<bool>,
     pub is_public: Option<bool>,
     pub is_home_charger: Option<bool>,
+    #[serde(default)]
+    pub meta: Option<ChargingSessionMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ChargingSessionMeta {
+    #[serde(default)]
+    pub transaction_id_grouping_key: Option<String>,
+    #[serde(default)]
+    pub data_sources: Vec<String>,
 }
 
 // --- Live Charging Session ---
@@ -165,6 +335,27 @@ pub struct ChargingSession {
 #[serde(rename_all = "camelCase")]
 pub struct LiveSessionData {
     pub get_live_session_data: Option<LiveChargingSession>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSessionHistoryData {
+    pub get_live_session_history: Option<LiveSessionHistory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSessionHistory {
+    #[serde(default)]
+    pub chart_data: Vec<LiveSessionHistoryPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LiveSessionHistoryPoint {
+    #[serde(default)]
+    pub kw: Option<f64>,
+    #[serde(default)]
+    pub time: Option<String>,
 }
 
 /// A single live charging session record. Fields with the `TsValue` shape
@@ -281,6 +472,47 @@ pub struct VehicleStateData {
     pub vehicle_state: Option<VehicleStateFields>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtaDetailsData {
+    #[serde(rename = "getVehicle")]
+    pub get_vehicle: Option<OtaVehicleDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OtaVehicleDetails {
+    #[serde(default)]
+    pub available_ota_update_details: Option<OtaUpdateDetail>,
+    #[serde(default)]
+    pub current_ota_update_details: Option<OtaUpdateDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OtaUpdateDetails {
+    pub available: Option<OtaUpdateDetail>,
+    pub current: Option<OtaUpdateDetail>,
+}
+
+impl From<OtaVehicleDetails> for OtaUpdateDetails {
+    fn from(details: OtaVehicleDetails) -> Self {
+        Self {
+            available: details.available_ota_update_details,
+            current: details.current_ota_update_details,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OtaUpdateDetail {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub locale: Option<String>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -302,6 +534,8 @@ pub struct VehicleStateFields {
     pub charge_port_state: Option<StateValue>,
     pub charger_derate_status: Option<StateValue>,
     pub remote_charging_available: Option<StateValue>,
+    pub battery_needs_lfp_calibration: Option<StateValue>,
+    pub charging_disabled_all: Option<StateValue>,
 
     // Climate
     pub cabin_climate_interior_temperature: Option<StateValue>,
@@ -329,6 +563,10 @@ pub struct VehicleStateFields {
     // OTA
     pub ota_current_version: Option<StateValue>,
     pub ota_available_version: Option<StateValue>,
+    pub ota_current_version_number: Option<StateValue>,
+    pub ota_available_version_number: Option<StateValue>,
+    pub ota_current_version_git_hash: Option<StateValue>,
+    pub ota_available_version_git_hash: Option<StateValue>,
     pub ota_status: Option<StateValue>,
     pub ota_current_status: Option<StateValue>,
     pub ota_current_version_week: Option<StateValue>,
@@ -359,18 +597,27 @@ pub struct VehicleStateFields {
     pub closure_tailgate_locked: Option<StateValue>,
     pub closure_side_bin_left_closed: Option<StateValue>,
     pub closure_side_bin_right_closed: Option<StateValue>,
+    pub closure_tonneau_closed: Option<StateValue>,
 
     // Windows
     pub window_front_left_closed: Option<StateValue>,
     pub window_front_right_closed: Option<StateValue>,
     pub window_rear_left_closed: Option<StateValue>,
     pub window_rear_right_closed: Option<StateValue>,
+    pub window_front_left_calibrated: Option<StateValue>,
+    pub window_front_right_calibrated: Option<StateValue>,
+    pub window_rear_left_calibrated: Option<StateValue>,
+    pub window_rear_right_calibrated: Option<StateValue>,
 
     // Tires
     pub tire_pressure_status_front_left: Option<StateValue>,
     pub tire_pressure_status_front_right: Option<StateValue>,
     pub tire_pressure_status_rear_left: Option<StateValue>,
     pub tire_pressure_status_rear_right: Option<StateValue>,
+    pub tire_pressure_status_valid_front_left: Option<StateValue>,
+    pub tire_pressure_status_valid_front_right: Option<StateValue>,
+    pub tire_pressure_status_valid_rear_left: Option<StateValue>,
+    pub tire_pressure_status_valid_rear_right: Option<StateValue>,
 
     // Security & misc
     pub pet_mode_status: Option<StateValue>,
@@ -384,6 +631,14 @@ pub struct VehicleStateFields {
     pub limited_regen_cold: Option<StateValue>,
     pub twelve_volt_battery_health: Option<StateValue>,
     pub battery_hv_thermal_event: Option<StateValue>,
+    pub battery_hv_thermal_event_propagation: Option<StateValue>,
+    pub brake_fluid_low: Option<StateValue>,
+    pub btm_ff_hardware_failure_status: Option<StateValue>,
+    pub btm_ic_hardware_failure_status: Option<StateValue>,
+    pub btm_lfd_hardware_failure_status: Option<StateValue>,
+    pub btm_oc_hardware_failure_status: Option<StateValue>,
+    pub btm_rfd_hardware_failure_status: Option<StateValue>,
+    pub btm_rf_hardware_failure_status: Option<StateValue>,
     pub service_mode: Option<StateValue>,
     pub trailer_status: Option<StateValue>,
     pub car_wash_mode: Option<StateValue>,
@@ -465,8 +720,8 @@ impl VehicleStateFields {
             serde_json::Value::Bool(flag) => Some(*flag),
             serde_json::Value::Number(num) => num.as_f64().map(|v| v != 0.0),
             serde_json::Value::String(text) => match text.to_ascii_lowercase().as_str() {
-                "true" | "1" | "on" | "enabled" | "yes" => Some(true),
-                "false" | "0" | "off" | "disabled" | "no" => Some(false),
+                "true" | "1" | "on" | "enabled" | "yes" | "closed" | "locked" => Some(true),
+                "false" | "0" | "off" | "disabled" | "no" | "open" | "unlocked" => Some(false),
                 _ => None,
             },
             _ => None,

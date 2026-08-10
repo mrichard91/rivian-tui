@@ -105,11 +105,6 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
     );
     body.push_str(HTML_HEAD_REST);
 
-    let vehicle_id = view
-        .vehicle_id
-        .as_deref()
-        .unwrap_or("no vehicle")
-        .to_string();
     let _ = write!(
         body,
         r#"<header class="topbar">
@@ -119,7 +114,7 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
   <a class="refresh" href="/">Refresh</a>
 </header>
 "#,
-        vehicle = escape(&vehicle_id),
+        vehicle = escape(&view.vehicle_label),
         updated = escape(&view.last_update_human),
     );
 
@@ -161,6 +156,14 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
         .filter(|a| a.kind != AlertKind::Ota)
         .collect();
     if !vehicle_alerts.is_empty() {
+        let severity_class = if vehicle_alerts
+            .iter()
+            .any(|alert| alert.severity == crate::view_model::AlertSeverity::Critical)
+        {
+            "critical"
+        } else {
+            "warning"
+        };
         let age = view
             .alerts
             .data_age
@@ -174,7 +177,7 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
             .join(" · ");
         let _ = writeln!(
             body,
-            r#"<div class="alert-banner critical">⚠ {messages}{age}</div>"#,
+            r#"<div class="alert-banner {severity_class}">⚠ {messages}{age}</div>"#,
         );
     }
 
@@ -263,11 +266,48 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
     );
 
     // Vehicle card
+    let mut vehicle_rows = String::new();
+    if let Some(meta) = &view.vehicle_metadata {
+        let _ = write!(
+            vehicle_rows,
+            r#"<dt>Name</dt><dd>{name}</dd>
+    <dt>Model</dt><dd>{model}</dd>
+    <dt>VIN</dt><dd class="mono">{vin}</dd>"#,
+            name = escape(&meta.display_name),
+            model = escape(&meta.model),
+            vin = escape(&meta.vin),
+        );
+        for (label, val) in [
+            ("Trim", &meta.trim),
+            ("Exterior", &meta.exterior_color),
+            ("Interior", &meta.interior_color),
+            ("Drive", &meta.drive_system),
+            ("Wheel", &meta.wheel),
+            ("Role", &meta.role),
+            ("State", &meta.state),
+        ] {
+            if val != "—" {
+                let _ = write!(
+                    vehicle_rows,
+                    "<dt>{}</dt><dd>{}</dd>",
+                    escape(label),
+                    escape(val)
+                );
+            }
+        }
+        let _ = write!(
+            vehicle_rows,
+            "<dt>Features</dt><dd>{}</dd><dt>OTA early access</dt><dd>{}</dd>",
+            meta.feature_count,
+            escape(&meta.ota_early_access),
+        );
+    }
     let _ = write!(
         body,
         r#"<section class="card">
   <h2>Vehicle</h2>
   <dl>
+    {meta_rows}
     <dt>Power</dt><dd>{power}</dd>
     <dt>Gear</dt><dd>{gear}</dd>
     <dt>Drive mode</dt><dd>{mode}</dd>
@@ -278,6 +318,7 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
   </dl>
 </section>
 "#,
+        meta_rows = vehicle_rows,
         power = escape(&view.vehicle.power_state),
         gear = escape(&view.vehicle.gear),
         mode = escape(&view.vehicle.drive_mode),
@@ -312,6 +353,16 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
             date = escape(&sw.available_version_date),
         );
     }
+    optional_row(&mut sw_rows, "Current build", &sw.current_version_number);
+    optional_row(&mut sw_rows, "Current git", &sw.current_git_hash);
+    if sw.update_available {
+        optional_row(
+            &mut sw_rows,
+            "Available build",
+            &sw.available_version_number,
+        );
+        optional_row(&mut sw_rows, "Available git", &sw.available_git_hash);
+    }
     let _ = write!(sw_rows, "<dt>Status</dt><dd>{}</dd>", escape(&sw.status));
     optional_row(&mut sw_rows, "Install type", &sw.install_type);
     let _ = write!(
@@ -332,6 +383,26 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
         optional_row(&mut sw_rows, "Download", &sw.download_progress);
         optional_row(&mut sw_rows, "Install", &sw.install_progress);
         optional_row(&mut sw_rows, "Duration", &sw.install_duration);
+    }
+    if let Some(details) = &view.ota_details {
+        if let Some(url) = &details.available_url {
+            let _ = write!(
+                sw_rows,
+                "<dt>Available notes</dt><dd><a href=\"{}\">{} {}</a></dd>",
+                escape(url),
+                escape(&details.available_version),
+                escape(&details.available_locale),
+            );
+        }
+        if let Some(url) = &details.current_url {
+            let _ = write!(
+                sw_rows,
+                "<dt>Current notes</dt><dd><a href=\"{}\">{} {}</a></dd>",
+                escape(url),
+                escape(&details.current_version),
+                escape(&details.current_locale),
+            );
+        }
     }
 
     let _ = write!(
@@ -372,12 +443,34 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
 
     // Live charge card — only appears while a session is in progress.
     if let Some(live) = &view.live_charge {
+        let history = view
+            .live_charge_history
+            .as_ref()
+            .map(|history| {
+                format!(
+                    r#"<dt>Average</dt><dd>{avg}</dd>
+    <dt>Peak</dt><dd>{peak}</dd>
+    <dt>Samples</dt><dd>{samples}</dd>
+    <dt>Chart updated</dt><dd>{updated}</dd>"#,
+                    avg = escape(&history.average_kw),
+                    peak = escape(&history.peak_kw),
+                    samples = history.point_count,
+                    updated = escape(&history.updated),
+                )
+            })
+            .unwrap_or_default();
+        let chart = view
+            .live_charge_history
+            .as_ref()
+            .map(render_live_charge_svg)
+            .unwrap_or_default();
         let _ = write!(
             body,
             r#"<section class="card">
   <h2>Live charge <span class="badge active">in progress</span></h2>
   <div class="big">{power}</div>
   <div class="muted">{charger} · {state}</div>
+  {chart}
   <dl>
     <dt>SOC</dt><dd>{soc}</dd>
     <dt>Energy added</dt><dd>{energy}</dd>
@@ -385,18 +478,21 @@ fn render_html(view: &DashboardView, refresh_interval_secs: u64) -> String {
     <dt>Session mi/kWh</dt><dd>{eff}</dd>
     <dt>Time remaining</dt><dd>{rem}</dd>
     <dt>Started</dt><dd>{started}</dd>
+    {history}
   </dl>
 </section>
 "#,
             power = escape(&live.power_kw),
             charger = escape(&live.charger_id),
             state = escape(&live.charger_state),
+            chart = chart,
             soc = escape(&live.soc_percent),
             energy = escape(&live.energy_delivered_kwh),
             range = escape(&live.range_added_miles),
             eff = escape(&live.session_efficiency),
             rem = escape(&live.time_remaining),
             started = escape(&live.started),
+            history = history,
         );
     }
 
@@ -566,6 +662,36 @@ fn render_trend_svg(points: &[crate::view_model::TrendPointView]) -> String {
     )
 }
 
+fn render_live_charge_svg(history: &crate::view_model::LiveChargeHistoryView) -> String {
+    if history.points.len() < 2 {
+        return String::new();
+    }
+
+    let width = 600.0;
+    let height = 100.0;
+    let pad = 8.0;
+    let values: Vec<f64> = history.points.iter().map(|p| p.kw.max(0.0)).collect();
+    let max = values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(1.0);
+    let path = build_path(&values, 0.0, max, width, height, pad);
+
+    format!(
+        r##"<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" class="charge-history">
+  <line x1="{pad}" y1="{pad}" x2="{xr}" y2="{pad}" stroke="#1f2a36" stroke-width="1"/>
+  <line x1="{pad}" y1="{yb}" x2="{xr}" y2="{yb}" stroke="#1f2a36" stroke-width="1"/>
+  <path d="{path}" fill="none" stroke="#4ade80" stroke-width="2"/>
+</svg>
+<div class="trend-legend"><span>0 kW</span><span>{latest}</span><span>{peak}</span></div>"##,
+        xr = width - pad,
+        yb = height - pad,
+        latest = escape(&history.latest_kw),
+        peak = escape(&history.peak_kw),
+    )
+}
+
 fn build_path(values: &[f64], min: f64, max: f64, width: f64, height: f64, pad: f64) -> String {
     let range = (max - min).max(f64::EPSILON);
     let step = (width - pad * 2.0) / (values.len() as f64 - 1.0).max(1.0);
@@ -657,6 +783,7 @@ const HTML_HEAD_REST: &str = r#"<title>rivian-tui dashboard</title>
   }
   .charging-line { color: var(--accent); font-size: 13px; margin-bottom: 8px; min-height: 16px; }
   .version { font-size: 22px; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .mono { font-family: ui-monospace, SFMono-Regular, monospace; }
   .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
     letter-spacing: 0.05em; font-weight: 600; }
   .badge.active { background: rgba(74,222,128,0.15); color: var(--accent); }
@@ -664,6 +791,7 @@ const HTML_HEAD_REST: &str = r#"<title>rivian-tui dashboard</title>
   .badge.idle { background: #1f2a36; color: var(--muted); }
   .muted { color: var(--muted); font-size: 12px; }
   .trend { width: 100%; height: 140px; display: block; }
+  .charge-history { width: 100%; height: 100px; display: block; margin: 8px 0 4px; }
   .trend-legend { display: flex; justify-content: space-between; gap: 12px; color: var(--muted);
     font-size: 12px; margin-top: 4px; flex-wrap: wrap; }
   .trend-legend .range-swatch { color: var(--warn); }
@@ -764,6 +892,21 @@ mod tests {
             html.contains("as of 1h"),
             "stale alerts must carry a data age"
         );
+    }
+
+    #[test]
+    fn warning_only_vehicle_alert_uses_warning_banner() {
+        let mut data = DashboardData::default();
+        let vs: VehicleStateFields =
+            serde_json::from_str(r#"{ "batteryNeedsLfpCalibration": { "value": true } }"#).unwrap();
+        data.vehicle_state = Some(vs);
+
+        let view = DashboardView::from_data(&data);
+        let html = render_html(&view, 30);
+
+        assert!(html.contains("Battery calibration needed"));
+        assert!(html.contains(r#"<div class="alert-banner warning">"#));
+        assert!(!html.contains(r#"<div class="alert-banner critical">"#));
     }
 
     #[test]

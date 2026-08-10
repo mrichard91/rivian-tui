@@ -22,10 +22,13 @@ pub const MAX_LOG_ENTRIES: usize = 500;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DashboardData {
     pub vehicle_state: Option<VehicleStateFields>,
+    pub vehicle_metadata: Option<VehicleMetadata>,
     pub recent_trend: Vec<VehicleTrendPoint>,
     pub recent_trips: Vec<Trip>,
     pub last_charge_session: Option<ChargeSessionSummary>,
     pub live_charging_session: Option<LiveChargingSession>,
+    pub live_charging_history: Option<LiveSessionHistory>,
+    pub ota_update_details: Option<OtaUpdateDetails>,
     pub charging_stats: Option<ChargingStats>,
     pub last_update: Option<DateTime<Utc>>,
     pub vehicle_id: Option<String>,
@@ -108,6 +111,18 @@ pub enum AppEvent {
         generation: u64,
         session: Option<Box<LiveChargingSession>>,
     },
+    LiveChargingHistory {
+        generation: u64,
+        history: Option<LiveSessionHistory>,
+    },
+    OtaDetails {
+        generation: u64,
+        details: Option<OtaUpdateDetails>,
+    },
+    VehicleMetadata {
+        generation: u64,
+        metadata: Option<VehicleMetadata>,
+    },
 }
 
 impl AppEvent {
@@ -124,7 +139,10 @@ impl AppEvent {
             | Self::Log { generation, .. }
             | Self::RequestLog { generation, .. }
             | Self::ChargingSessions { generation, .. }
-            | Self::LiveChargingSession { generation, .. } => Some(*generation),
+            | Self::LiveChargingSession { generation, .. }
+            | Self::LiveChargingHistory { generation, .. }
+            | Self::OtaDetails { generation, .. }
+            | Self::VehicleMetadata { generation, .. } => Some(*generation),
         }
     }
 }
@@ -150,12 +168,16 @@ pub struct App {
 
     // Vehicle data
     pub vehicle_state: Option<VehicleStateFields>,
+    pub vehicle_metadata: Option<VehicleMetadata>,
     pub recent_trend: Vec<VehicleTrendPoint>,
     pub recent_trips: Vec<Trip>,
     pub last_charge_session: Option<ChargeSessionSummary>,
     pub live_charging_session: Option<LiveChargingSession>,
+    pub live_charging_history: Option<LiveSessionHistory>,
+    pub ota_update_details: Option<OtaUpdateDetails>,
     pub charging_stats: Option<ChargingStats>,
     pub last_update: Option<DateTime<Utc>>,
+    pub vehicle_state_error: Option<String>,
     pub poll_interval_secs: u64,
 
     // Activity log
@@ -212,12 +234,16 @@ impl App {
             vehicle_selection_index: 0,
 
             vehicle_state: None,
+            vehicle_metadata: None,
             recent_trend: Vec::new(),
             recent_trips: Vec::new(),
             last_charge_session: None,
             live_charging_session: None,
+            live_charging_history: None,
+            ota_update_details: None,
             charging_stats: None,
             last_update: None,
+            vehicle_state_error: None,
             poll_interval_secs: 300,
 
             activity_log: Vec::new(),
@@ -247,10 +273,13 @@ impl App {
     fn sync_shared_data(&self) {
         let snapshot = DashboardData {
             vehicle_state: self.vehicle_state.clone(),
+            vehicle_metadata: self.vehicle_metadata.clone(),
             recent_trend: self.recent_trend.clone(),
             recent_trips: self.recent_trips.clone(),
             last_charge_session: self.last_charge_session.clone(),
             live_charging_session: self.live_charging_session.clone(),
+            live_charging_history: self.live_charging_history.clone(),
+            ota_update_details: self.ota_update_details.clone(),
             charging_stats: self.charging_stats.clone(),
             last_update: self.last_update,
             vehicle_id: self.tokens.as_ref().map(|t| t.vehicle_id.clone()),
@@ -480,6 +509,7 @@ impl App {
                     }
                 }
                 AppEvent::VehicleState { state, .. } => {
+                    self.vehicle_state_error = None;
                     let vehicle_id = self
                         .tokens
                         .as_ref()
@@ -508,6 +538,7 @@ impl App {
                     self.vehicle_state = Some(*state);
                     self.last_update = Some(Utc::now());
                     self.refresh_dashboard_insights();
+                    self.fetch_ota_details();
                     self.log(
                         LogLevel::Info,
                         &format!(
@@ -524,6 +555,7 @@ impl App {
                         // Session ended — drop the stale live snapshot and
                         // refresh the historical view so a brand-new
                         // completed session shows up immediately.
+                        self.live_charging_history = None;
                         self.fetch_charging_history();
                         self.sync_shared_data();
                     }
@@ -538,6 +570,8 @@ impl App {
                     self.login_password.clear();
                     self.login_otp.clear();
                     self.refresh_dashboard_insights();
+                    self.fetch_vehicle_metadata();
+                    self.fetch_ota_details();
                     self.log(
                         LogLevel::Info,
                         "Login successful — fetching vehicle state...",
@@ -566,6 +600,9 @@ impl App {
                 AppEvent::Error { msg, .. } => {
                     self.login_busy = false;
                     self.login_error = Some(msg.clone());
+                    if msg.starts_with("Poll failed:") {
+                        self.vehicle_state_error = Some(msg.clone());
+                    }
                     self.log(LogLevel::Error, &msg);
                 }
                 AppEvent::Log { entry, .. } => {
@@ -667,7 +704,26 @@ impl App {
                         self.log(LogLevel::Info, &format!("Live charging: {power} @ {soc}"));
                     }
 
+                    let has_live = live.is_some();
                     self.live_charging_session = live;
+                    if !has_live {
+                        self.live_charging_history = None;
+                    }
+                    self.sync_shared_data();
+                    if has_live {
+                        self.fetch_live_session_history();
+                    }
+                }
+                AppEvent::LiveChargingHistory { history, .. } => {
+                    self.live_charging_history = history;
+                    self.sync_shared_data();
+                }
+                AppEvent::OtaDetails { details, .. } => {
+                    self.ota_update_details = details;
+                    self.sync_shared_data();
+                }
+                AppEvent::VehicleMetadata { metadata, .. } => {
+                    self.vehicle_metadata = metadata;
                     self.sync_shared_data();
                 }
                 AppEvent::ChargingSessions { sessions, .. } => {
@@ -840,6 +896,7 @@ impl App {
         let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
+        self.vehicle_state_error = None;
         self.log(LogLevel::Info, "Fetching vehicle state...");
 
         tokio::spawn(async move {
@@ -923,6 +980,145 @@ impl App {
                     let _ = tx.send(AppEvent::Error {
                         generation,
                         msg: format!("Live session: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Fetch the current live charging session's power history. This is a
+    /// charging-endpoint chart series (`kw`, `time`) and is only useful while
+    /// a live session exists.
+    pub fn fetch_live_session_history(&mut self) {
+        let Some(tokens) = &self.tokens else {
+            return;
+        };
+        let vehicle_id = tokens.vehicle_id.clone();
+        let headers = authenticated_headers(tokens);
+        let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
+        let debug = self.debug;
+        let generation = self.generation;
+
+        tokio::spawn(async move {
+            let client = Self::make_client(http, debug, &tx, generation);
+
+            let vars = serde_json::json!({ "vehicleId": vehicle_id });
+            let result: Result<LiveSessionHistoryData, _> = client
+                .graphql(
+                    CHARGING_URL,
+                    "getLiveSessionHistory",
+                    queries::GET_LIVE_CHARGING_HISTORY,
+                    Some(vars),
+                    Some(headers),
+                )
+                .await;
+
+            match result {
+                Ok(data) => {
+                    let _ = tx.send(AppEvent::LiveChargingHistory {
+                        generation,
+                        history: data.get_live_session_history,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Live charge history: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Fetch release-note/detail URLs for the current and available OTA
+    /// versions.
+    pub fn fetch_ota_details(&mut self) {
+        let Some(tokens) = &self.tokens else {
+            return;
+        };
+        let vehicle_id = tokens.vehicle_id.clone();
+        let headers = authenticated_headers(tokens);
+        let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
+        let debug = self.debug;
+        let generation = self.generation;
+
+        tokio::spawn(async move {
+            let client = Self::make_client(http, debug, &tx, generation);
+
+            let vars = serde_json::json!({ "vehicleId": vehicle_id });
+            let result: Result<OtaDetailsData, _> = client
+                .graphql(
+                    API_URL,
+                    "getOTAUpdateDetails",
+                    queries::GET_OTA_UPDATE_DETAILS,
+                    Some(vars),
+                    Some(headers),
+                )
+                .await;
+
+            match result {
+                Ok(data) => {
+                    let details = data.get_vehicle.map(OtaUpdateDetails::from);
+                    let _ = tx.send(AppEvent::OtaDetails {
+                        generation,
+                        details,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("OTA details: {e}"),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Fetch richer selected-vehicle metadata for labels and web JSON. This
+    /// intentionally does not surface personal account fields.
+    pub fn fetch_vehicle_metadata(&mut self) {
+        let Some(tokens) = &self.tokens else {
+            return;
+        };
+        let vehicle_id = tokens.vehicle_id.clone();
+        let headers = authenticated_headers(tokens);
+        let tx = self.event_tx.clone();
+        let http = self.http_client.clone();
+        let debug = self.debug;
+        let generation = self.generation;
+
+        tokio::spawn(async move {
+            let client = Self::make_client(http, debug, &tx, generation);
+
+            let result: Result<UserInfoData, _> = client
+                .graphql(
+                    API_URL,
+                    "getUserInfo",
+                    queries::GET_USER_INFO,
+                    None,
+                    Some(headers),
+                )
+                .await;
+
+            match result {
+                Ok(data) => {
+                    let metadata = data
+                        .current_user
+                        .vehicles
+                        .iter()
+                        .find(|vehicle| vehicle.id == vehicle_id)
+                        .map(Vehicle::metadata);
+                    let _ = tx.send(AppEvent::VehicleMetadata {
+                        generation,
+                        metadata,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Error {
+                        generation,
+                        msg: format!("Vehicle metadata: {e}"),
                     });
                 }
             }
@@ -1019,6 +1215,8 @@ impl App {
                 self.login_password.clear();
                 self.login_otp.clear();
                 self.refresh_dashboard_insights();
+                self.fetch_vehicle_metadata();
+                self.fetch_ota_details();
                 self.log(
                     LogLevel::Info,
                     &format!("Selected vehicle {}", vehicle.name.unwrap_or(vehicle.id)),
@@ -1042,12 +1240,16 @@ impl App {
         let _ = AuthManager::clear_tokens();
         self.tokens = None;
         self.vehicle_state = None;
+        self.vehicle_metadata = None;
         self.recent_trend.clear();
         self.recent_trips.clear();
         self.last_charge_session = None;
         self.live_charging_session = None;
+        self.live_charging_history = None;
+        self.ota_update_details = None;
         self.charging_stats = None;
         self.last_update = None;
+        self.vehicle_state_error = None;
         self.mfa_state = None;
         self.pending_vehicle_selection = None;
         self.login_email.clear();
@@ -1221,5 +1423,30 @@ mod tests {
         assert!(app.live_charging_session.is_none());
         let shared = app.shared_data.read().unwrap();
         assert!(shared.live_charging_session.is_none());
+    }
+
+    #[test]
+    fn vehicle_state_error_clears_after_successful_poll() {
+        let mut app = App::new(false, None);
+        app.event_tx
+            .send(AppEvent::Error {
+                generation: app.generation,
+                msg: "Poll failed: test failure".into(),
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(
+            app.vehicle_state_error.as_deref(),
+            Some("Poll failed: test failure")
+        );
+
+        app.event_tx
+            .send(AppEvent::VehicleState {
+                generation: app.generation,
+                state: Box::default(),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(app.vehicle_state_error.is_none());
     }
 }
