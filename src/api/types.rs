@@ -45,14 +45,20 @@ pub struct GraphQlError {
 }
 
 impl GraphQlError {
-    pub fn display_message(&self) -> String {
-        let code = self
-            .extensions
+    fn code(&self) -> Option<&str> {
+        self.extensions
             .as_ref()
             .and_then(|ext| ext.get("code"))
-            .and_then(|code| code.as_str());
+            .and_then(|code| code.as_str())
+    }
 
-        match code {
+    /// The gateway's "your session is no longer valid" signal.
+    pub fn is_unauthenticated(&self) -> bool {
+        self.code() == Some("UNAUTHENTICATED")
+    }
+
+    pub fn display_message(&self) -> String {
+        match self.code() {
             Some(code) => format!("{} ({code})", self.message),
             None => self.message.clone(),
         }

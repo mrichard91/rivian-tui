@@ -99,7 +99,9 @@ impl AuthManager {
     fn legacy_token_file_path() -> Result<PathBuf> {
         #[cfg(test)]
         {
-            let overrides = test_support::AUTH_TEST_OVERRIDES.lock().unwrap();
+            let overrides = test_support::AUTH_TEST_OVERRIDES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(path) = overrides.legacy_token_path.clone() {
                 return Ok(path);
             }
@@ -115,7 +117,9 @@ impl AuthManager {
     fn keyring_entry() -> Result<keyring::Entry> {
         #[cfg(test)]
         let (service_name, account_name) = {
-            let overrides = test_support::AUTH_TEST_OVERRIDES.lock().unwrap();
+            let overrides = test_support::AUTH_TEST_OVERRIDES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             (
                 overrides
                     .keyring_service_name
@@ -203,7 +207,11 @@ impl AuthManager {
 
         if tokens.is_none() {
             if let Some(legacy) = Self::load_legacy_tokens()? {
-                let _ = Self::save_tokens_to_keyring(&legacy);
+                // Migrate into the keychain and, once that has succeeded,
+                // remove the plaintext copy so it stops lingering on disk.
+                if Self::save_tokens_to_keyring(&legacy).is_ok() {
+                    let _ = Self::clear_legacy_token_file();
+                }
                 tokens = Some(legacy);
             }
         }
@@ -226,15 +234,21 @@ impl AuthManager {
         Ok(None)
     }
 
+    /// Persist tokens. The OS keychain is the store of record; the plaintext
+    /// `tokens.json` is written only as a fallback when the keychain is
+    /// unavailable (e.g. headless Linux without a secret service), and any
+    /// stale copy is removed whenever the keychain write succeeds.
     pub fn save_tokens(tokens: &AuthTokens) -> Result<()> {
-        let keyring_result = Self::save_tokens_to_keyring(tokens);
-        let legacy_result = Self::save_legacy_tokens(tokens);
-
-        match (keyring_result, legacy_result) {
-            (Ok(()), Ok(())) | (Ok(()), Err(_)) | (Err(_), Ok(())) => Ok(()),
-            (Err(keyring_err), Err(legacy_err)) => Err(anyhow!(
-                "failed to save tokens to both keychain and legacy file: {keyring_err}; {legacy_err}"
-            )),
+        match Self::save_tokens_to_keyring(tokens) {
+            Ok(()) => {
+                let _ = Self::clear_legacy_token_file();
+                Ok(())
+            }
+            Err(keyring_err) => Self::save_legacy_tokens(tokens).map_err(|legacy_err| {
+                anyhow!(
+                    "failed to save tokens to both keychain and legacy file: {keyring_err}; {legacy_err}"
+                )
+            }),
         }
     }
 
@@ -460,7 +474,11 @@ pub(crate) struct AuthTestContext {
 #[cfg(test)]
 impl AuthTestContext {
     pub(crate) fn new() -> Self {
-        let lock = test_support::AUTH_TEST_LOCK.lock().unwrap();
+        // A panicking test poisons the lock; recover so one failure doesn't
+        // cascade into every other auth test.
+        let lock = test_support::AUTH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let unique = uuid::Uuid::new_v4().to_string();
         let legacy_token_dir = std::env::temp_dir().join(format!("rivian-tui-test-{unique}"));
         fs::create_dir_all(&legacy_token_dir).unwrap();
@@ -468,7 +486,9 @@ impl AuthTestContext {
         let keyring_service_name = format!("rivian-tui-test-{unique}");
         let keyring_account_name = "auth_tokens".to_string();
 
-        let mut guard = test_support::AUTH_TEST_OVERRIDES.lock().unwrap();
+        let mut guard = test_support::AUTH_TEST_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.legacy_token_path = Some(legacy_token_dir.join(TOKEN_FILE_NAME));
         guard.keyring_service_name = Some(keyring_service_name.clone());
         guard.keyring_account_name = Some(keyring_account_name.clone());
@@ -494,7 +514,9 @@ impl Drop for AuthTestContext {
 
         let _ = fs::remove_file(self.legacy_token_dir.join(TOKEN_FILE_NAME));
         let _ = fs::remove_dir_all(&self.legacy_token_dir);
-        let mut guard = test_support::AUTH_TEST_OVERRIDES.lock().unwrap();
+        let mut guard = test_support::AUTH_TEST_OVERRIDES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.legacy_token_path = None;
         guard.keyring_service_name = None;
         guard.keyring_account_name = None;
@@ -601,9 +623,36 @@ mod tests {
         AuthManager::save_tokens(&tokens).unwrap();
         let loaded = AuthManager::load_tokens().unwrap().unwrap();
         assert_eq!(loaded.vehicle_id, "test-vid");
-        assert!(AuthManager::legacy_token_file_path().unwrap().exists());
+        assert!(
+            !AuthManager::legacy_token_file_path().unwrap().exists(),
+            "tokens must not be written to a plaintext file when the keychain works"
+        );
 
         AuthManager::clear_tokens().unwrap();
         assert!(AuthManager::load_legacy_tokens().unwrap().is_none());
+    }
+
+    #[test]
+    fn load_tokens_migrates_legacy_file_into_keychain_and_removes_it() {
+        let _ctx = AuthTestContext::new();
+        let tokens = AuthTokens {
+            access_token: "legacy-at".into(),
+            refresh_token: "legacy-rt".into(),
+            user_session_token: "legacy-ust".into(),
+            csrf_token: "legacy-csrf".into(),
+            app_session_token: "legacy-ast".into(),
+            vehicle_id: "legacy-vid".into(),
+            device_id: Some("legacy-device".into()),
+        };
+        let path = AuthManager::legacy_token_file_path().unwrap();
+        fs::write(&path, serde_json::to_string(&tokens).unwrap()).unwrap();
+
+        let loaded = AuthManager::load_tokens().unwrap().unwrap();
+        assert_eq!(loaded.vehicle_id, "legacy-vid");
+        assert!(!path.exists(), "legacy file must be removed once migrated");
+
+        // Second load comes from the keychain alone.
+        let again = AuthManager::load_tokens().unwrap().unwrap();
+        assert_eq!(again.access_token, "legacy-at");
     }
 }

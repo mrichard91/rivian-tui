@@ -40,7 +40,13 @@ fn kv_pair(w: usize, label: &str, l: &(String, Color), r: &(String, Color)) -> L
 fn status_color(value: &str) -> Color {
     let value = value.to_ascii_lowercase();
 
-    if value.contains("open")
+    // Order matters: negated / idle tokens ("not_ready", "ota_not_available",
+    // "inactive") contain the positive word, so they must be classified
+    // before the green substring checks. "success" is checked first because
+    // "install_success" would otherwise be caught by the yellow "install".
+    if value.contains("success") {
+        Color::Green
+    } else if value.contains("open")
         || value.contains("low")
         || value.contains("fail")
         || value.contains("error")
@@ -54,15 +60,6 @@ fn status_color(value: &str) -> Color {
         || value.contains("warning")
     {
         Color::Yellow
-    } else if value.contains("closed")
-        || value.contains("locked")
-        || value == "ok"
-        || value.contains("enabled")
-        || value.contains("normal")
-        || value.contains("success")
-        || value.contains("ready")
-    {
-        Color::Green
     } else if value.contains("unknown")
         || value.contains("signal")
         || value.contains("not_")
@@ -73,8 +70,27 @@ fn status_color(value: &str) -> Color {
         || value == "false"
     {
         Color::DarkGray
+    } else if value.contains("closed")
+        || value.contains("locked")
+        || value == "ok"
+        || value.contains("enabled")
+        || value.contains("normal")
+        || value.contains("ready")
+    {
+        Color::Green
     } else {
         Color::White
+    }
+}
+
+/// Charge-port door colour. An open port is the normal state while plugged
+/// in, so it is informational (yellow), not an error like an open door.
+/// Wire tokens are `open`, `opening`, `close` (no trailing d).
+fn charge_port_color(value: &str) -> Color {
+    match value.to_ascii_lowercase().as_str() {
+        "open" | "opening" | "closing" => Color::Yellow,
+        "close" | "closed" => Color::Green,
+        _ => Color::DarkGray,
     }
 }
 
@@ -355,7 +371,7 @@ fn draw_col_battery(frame: &mut Frame, area: Rect, vs: &crate::api::types::Vehic
             CW,
             "Port",
             vs.get_str(&vs.charge_port_state),
-            status_color(vs.get_str(&vs.charge_port_state)),
+            charge_port_color(vs.get_str(&vs.charge_port_state)),
         ),
         kv(CW, "Remote", &remote.0, remote.1),
         kv(CW, "Thermal", thermal, thermal_color),
@@ -1511,4 +1527,26 @@ fn centered_rect_pct(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_color_negated_tokens_are_not_green() {
+        assert_eq!(status_color("not_ready"), Color::DarkGray);
+        assert_eq!(status_color("ota_not_available"), Color::DarkGray);
+        assert_eq!(status_color("Install_Success"), Color::Green);
+        assert_eq!(status_color("ready"), Color::Green);
+    }
+
+    #[test]
+    fn charge_port_open_is_not_an_error_colour() {
+        // Wire tokens observed: "open", "opening", "close" (not "closed").
+        assert_eq!(charge_port_color("open"), Color::Yellow);
+        assert_eq!(charge_port_color("opening"), Color::Yellow);
+        assert_eq!(charge_port_color("close"), Color::Green);
+        assert_eq!(charge_port_color("unknown"), Color::DarkGray);
+    }
 }

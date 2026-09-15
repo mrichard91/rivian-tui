@@ -2,11 +2,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use chrono::{DateTime, Local, Utc};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::api::auth::{authenticated_headers, AuthManager, LoginOutcome, PendingVehicleSelection};
-use crate::api::client::{RequestLog, RivianClient, API_URL, CHARGING_URL};
+use crate::api::client::{RequestLog, RivianClient, SessionExpired, API_URL, CHARGING_URL};
 use crate::api::queries;
 use crate::api::types::*;
 use crate::db::{ChargeSessionSummary, ChargingStats, Db, Trip, VehicleTrendPoint};
@@ -34,7 +35,11 @@ pub struct DashboardData {
     pub vehicle_id: Option<String>,
 }
 
-pub type SharedDashboardData = Arc<RwLock<DashboardData>>;
+/// Readers (the web server) clone the inner `Arc` under a brief read lock
+/// and then work on an immutable snapshot, so a page render never holds the
+/// lock and never deep-copies the trend/chart series. The writer swaps in a
+/// fresh `Arc` per update.
+pub type SharedDashboardData = Arc<RwLock<Arc<DashboardData>>>;
 
 /// UI mode / active screen
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +74,37 @@ pub struct LogEntry {
     pub detail: Option<String>,
 }
 
+/// Which background operation an `AppEvent::Error` came from. The handler
+/// routes on this (login-screen errors vs. dashboard poll errors vs. purely
+/// informational fetch failures) instead of sniffing message prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorSource {
+    Login,
+    Otp,
+    Poll,
+    LiveSession,
+    LiveHistory,
+    OtaDetails,
+    Metadata,
+    ChargingHistory,
+}
+
+impl ErrorSource {
+    /// Human prefix for the activity log / error panels.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Login => "Login failed",
+            Self::Otp => "OTP failed",
+            Self::Poll => "Poll failed",
+            Self::LiveSession => "Live session",
+            Self::LiveHistory => "Live charge history",
+            Self::OtaDetails => "OTA details",
+            Self::Metadata => "Vehicle metadata",
+            Self::ChargingHistory => "Charging history",
+        }
+    }
+}
+
 /// Events sent from background tasks to the main loop
 pub enum AppEvent {
     /// Log message produced by a long-lived service (e.g. MQTT). Bypasses
@@ -93,7 +129,12 @@ pub enum AppEvent {
     },
     Error {
         generation: u64,
+        source: ErrorSource,
         msg: String,
+    },
+    /// The API rejected the saved session; the user must sign in again.
+    SessionExpired {
+        generation: u64,
     },
     Log {
         generation: u64,
@@ -136,6 +177,7 @@ impl AppEvent {
             | Self::MfaRequired { generation, .. }
             | Self::VehicleSelectionRequired { generation, .. }
             | Self::Error { generation, .. }
+            | Self::SessionExpired { generation }
             | Self::Log { generation, .. }
             | Self::RequestLog { generation, .. }
             | Self::ChargingSessions { generation, .. }
@@ -179,6 +221,9 @@ pub struct App {
     pub last_update: Option<DateTime<Utc>>,
     pub vehicle_state_error: Option<String>,
     pub poll_interval_secs: u64,
+    /// A vehicle-state request is outstanding. Prevents `r` mashing or an
+    /// overlapping interval tick from stacking identical polls.
+    pub poll_in_flight: bool,
 
     // Activity log
     pub activity_log: Vec<LogEntry>,
@@ -198,6 +243,11 @@ pub struct App {
     /// per-task `RivianClient` reuses the same pool instead of building a
     /// fresh one.
     http_client: reqwest::Client,
+
+    /// Endpoint URLs. Fields (not consts) so tests can point at an
+    /// unroutable local address.
+    pub api_url: String,
+    pub charging_url: String,
 
     /// When the last `fetch_live_session` fired. Lets the main loop poll
     /// the charging endpoint on a faster cadence than the full vehicle-state
@@ -245,6 +295,7 @@ impl App {
             last_update: None,
             vehicle_state_error: None,
             poll_interval_secs: 300,
+            poll_in_flight: false,
 
             activity_log: Vec::new(),
             log_scroll: 0,
@@ -260,11 +311,14 @@ impl App {
             http_client: RivianClient::build_http()
                 .expect("reqwest client builder uses static config; should not fail"),
 
+            api_url: API_URL.to_string(),
+            charging_url: CHARGING_URL.to_string(),
+
             last_live_fetch: None,
 
             event_tx,
             event_rx,
-            shared_data: Arc::new(RwLock::new(DashboardData::default())),
+            shared_data: Arc::new(RwLock::new(Arc::new(DashboardData::default()))),
         }
     }
 
@@ -285,7 +339,7 @@ impl App {
             vehicle_id: self.tokens.as_ref().map(|t| t.vehicle_id.clone()),
         };
         if let Ok(mut guard) = self.shared_data.write() {
-            *guard = snapshot;
+            *guard = Arc::new(snapshot);
         }
     }
 
@@ -509,7 +563,9 @@ impl App {
                     }
                 }
                 AppEvent::VehicleState { state, .. } => {
+                    self.poll_in_flight = false;
                     self.vehicle_state_error = None;
+                    let refresh_ota = self.ota_details_need_refresh(&state);
                     let vehicle_id = self
                         .tokens
                         .as_ref()
@@ -538,7 +594,9 @@ impl App {
                     self.vehicle_state = Some(*state);
                     self.last_update = Some(Utc::now());
                     self.refresh_dashboard_insights();
-                    self.fetch_ota_details();
+                    if refresh_ota {
+                        self.fetch_ota_details();
+                    }
                     self.log(
                         LogLevel::Info,
                         &format!(
@@ -569,13 +627,11 @@ impl App {
                     self.login_error = None;
                     self.login_password.clear();
                     self.login_otp.clear();
-                    self.refresh_dashboard_insights();
-                    self.fetch_vehicle_metadata();
-                    self.fetch_ota_details();
                     self.log(
                         LogLevel::Info,
                         "Login successful — fetching vehicle state...",
                     );
+                    self.start_session();
                 }
                 AppEvent::MfaRequired { mfa, .. } => {
                     self.mfa_state = Some(mfa);
@@ -597,13 +653,30 @@ impl App {
                         "Multiple vehicles found — choose a vehicle to continue",
                     );
                 }
-                AppEvent::Error { msg, .. } => {
-                    self.login_busy = false;
-                    self.login_error = Some(msg.clone());
-                    if msg.starts_with("Poll failed:") {
-                        self.vehicle_state_error = Some(msg.clone());
+                AppEvent::Error { source, msg, .. } => {
+                    match source {
+                        ErrorSource::Login | ErrorSource::Otp => {
+                            self.login_busy = false;
+                            self.login_error = Some(msg.clone());
+                        }
+                        ErrorSource::Poll => {
+                            self.poll_in_flight = false;
+                            self.vehicle_state_error = Some(msg.clone());
+                        }
+                        ErrorSource::LiveSession
+                        | ErrorSource::LiveHistory
+                        | ErrorSource::OtaDetails
+                        | ErrorSource::Metadata
+                        | ErrorSource::ChargingHistory => {}
                     }
                     self.log(LogLevel::Error, &msg);
+                }
+                AppEvent::SessionExpired { .. } => {
+                    const MSG: &str = "Session expired — please sign in again";
+                    let _ = AuthManager::clear_tokens();
+                    self.reset_session();
+                    self.login_error = Some(MSG.into());
+                    self.log(LogLevel::Error, MSG);
                 }
                 AppEvent::Log { entry, .. } => {
                     let was_tailing = self.log_is_tailing();
@@ -625,6 +698,15 @@ impl App {
 
                     if let Some(err) = &req_log.error {
                         self.log(LogLevel::Error, &format!("{summary} ({err})"));
+                    } else if !req_log.warnings.is_empty() {
+                        self.log(
+                            LogLevel::Error,
+                            &format!(
+                                "{} partial response: {}",
+                                req_log.operation,
+                                req_log.warnings.join("; ")
+                            ),
+                        );
                     } else if self.debug {
                         let mut detail = String::new();
                         if let Some(hdrs) = &req_log.request_headers {
@@ -830,6 +912,7 @@ impl App {
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error {
                         generation,
+                        source: ErrorSource::Login,
                         msg: format!("Login failed: {e}"),
                     });
                 }
@@ -872,12 +955,14 @@ impl App {
                 Ok(LoginOutcome::MfaRequired(_)) => {
                     let _ = tx.send(AppEvent::Error {
                         generation,
+                        source: ErrorSource::Otp,
                         msg: "OTP verification returned another MFA challenge".into(),
                     });
                 }
                 Err(e) => {
                     let _ = tx.send(AppEvent::Error {
                         generation,
+                        source: ErrorSource::Otp,
                         msg: format!("OTP failed: {e}"),
                     });
                 }
@@ -885,58 +970,117 @@ impl App {
         });
     }
 
-    /// Fetch vehicle state in the background
-    pub fn poll_vehicle_state(&mut self) {
+    /// Spawn one authenticated GraphQL query. Owns the lifecycle every
+    /// fetch shares: token guard, client construction, generation tagging,
+    /// and the error path (a rejected session becomes `SessionExpired`;
+    /// anything else becomes `Error { source }` with the source's label as
+    /// the message prefix). `on_ok` turns the decoded payload into the event
+    /// to deliver. Returns false when there are no tokens to send.
+    fn spawn_query<T, F>(
+        &self,
+        url: String,
+        op_name: &'static str,
+        query: &'static str,
+        vars: Option<serde_json::Value>,
+        source: ErrorSource,
+        on_ok: F,
+    ) -> bool
+    where
+        T: DeserializeOwned + Send + 'static,
+        F: FnOnce(u64, T) -> AppEvent + Send + 'static,
+    {
         let Some(tokens) = &self.tokens else {
-            return;
+            return false;
         };
-        let vehicle_id = tokens.vehicle_id.clone();
         let headers = authenticated_headers(tokens);
         let tx = self.event_tx.clone();
         let http = self.http_client.clone();
         let debug = self.debug;
         let generation = self.generation;
-        self.vehicle_state_error = None;
-        self.log(LogLevel::Info, "Fetching vehicle state...");
 
         tokio::spawn(async move {
             let client = Self::make_client(http, debug, &tx, generation);
-
-            let vars = serde_json::json!({ "vehicleID": vehicle_id });
-
-            let result: Result<VehicleStateData, _> = client
-                .graphql(
-                    API_URL,
-                    "GetVehicleState",
-                    queries::GET_VEHICLE_STATE,
-                    Some(vars),
-                    Some(headers),
-                )
+            let result: anyhow::Result<T> = client
+                .graphql(&url, op_name, query, vars, Some(headers))
                 .await;
-
-            match result {
-                Ok(data) => match data.vehicle_state {
-                    Some(state) => {
-                        let _ = tx.send(AppEvent::VehicleState {
-                            generation,
-                            state: Box::new(state),
-                        });
-                    }
-                    None => {
-                        let _ = tx.send(AppEvent::Error {
-                            generation,
-                            msg: "Poll failed: vehicle state was missing from the response".into(),
-                        });
-                    }
-                },
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Poll failed: {e}"),
-                    });
+            let event = match result {
+                Ok(data) => on_ok(generation, data),
+                Err(e) if e.downcast_ref::<SessionExpired>().is_some() => {
+                    AppEvent::SessionExpired { generation }
                 }
-            }
+                Err(e) => AppEvent::Error {
+                    generation,
+                    source,
+                    msg: format!("{}: {e}", source.label()),
+                },
+            };
+            let _ = tx.send(event);
         });
+        true
+    }
+
+    /// Everything a freshly authenticated session needs: the one-shot
+    /// metadata and OTA-detail lookups plus the first vehicle-state poll and
+    /// charging history. Single entry point so startup, login, and vehicle
+    /// selection can't drift on the bundle.
+    pub fn start_session(&mut self) {
+        self.refresh_dashboard_insights();
+        self.fetch_vehicle_metadata();
+        self.fetch_ota_details();
+        self.poll_vehicle_state();
+        self.fetch_charging_history();
+    }
+
+    /// Fetch vehicle state in the background. Returns false if a poll is
+    /// already outstanding or there is no session.
+    pub fn poll_vehicle_state(&mut self) -> bool {
+        if self.poll_in_flight {
+            return false;
+        }
+        let Some(tokens) = &self.tokens else {
+            return false;
+        };
+        let vars = serde_json::json!({ "vehicleID": tokens.vehicle_id });
+        let started = self.spawn_query::<VehicleStateData, _>(
+            self.api_url.clone(),
+            "GetVehicleState",
+            queries::GET_VEHICLE_STATE,
+            Some(vars),
+            ErrorSource::Poll,
+            |generation, data| match data.vehicle_state {
+                Some(state) => AppEvent::VehicleState {
+                    generation,
+                    state: Box::new(state),
+                },
+                None => AppEvent::Error {
+                    generation,
+                    source: ErrorSource::Poll,
+                    msg: "Poll failed: vehicle state was missing from the response".into(),
+                },
+            },
+        );
+        if started {
+            self.poll_in_flight = true;
+            self.vehicle_state_error = None;
+            self.log(LogLevel::Info, "Fetching vehicle state...");
+        }
+        started
+    }
+
+    /// Release-note URLs only change when the installed or offered OTA
+    /// version changes, so refetch on a poll only when those fields moved
+    /// (or a previous fetch never produced details). With no prior state the
+    /// session bundle has just requested them.
+    pub fn ota_details_need_refresh(&self, new_state: &VehicleStateFields) -> bool {
+        let Some(prev) = &self.vehicle_state else {
+            return false;
+        };
+        if self.ota_update_details.is_none() {
+            return true;
+        }
+        prev.get_str(&prev.ota_current_version) != new_state.get_str(&new_state.ota_current_version)
+            || prev.get_str(&prev.ota_available_version)
+                != new_state.get_str(&new_state.ota_available_version)
     }
 
     /// Fetch the current live charging session from the charging endpoint.
@@ -947,43 +1091,19 @@ impl App {
         let Some(tokens) = &self.tokens else {
             return;
         };
-        let vehicle_id = tokens.vehicle_id.clone();
-        let headers = authenticated_headers(tokens);
-        let tx = self.event_tx.clone();
-        let http = self.http_client.clone();
-        let debug = self.debug;
-        let generation = self.generation;
+        let vars = serde_json::json!({ "vehicleId": tokens.vehicle_id });
         self.last_live_fetch = Some(Instant::now());
-
-        tokio::spawn(async move {
-            let client = Self::make_client(http, debug, &tx, generation);
-
-            let vars = serde_json::json!({ "vehicleId": vehicle_id });
-            let result: Result<LiveSessionData, _> = client
-                .graphql(
-                    CHARGING_URL,
-                    "getLiveSessionData",
-                    queries::GET_LIVE_CHARGING_SESSION,
-                    Some(vars),
-                    Some(headers),
-                )
-                .await;
-
-            match result {
-                Ok(data) => {
-                    let _ = tx.send(AppEvent::LiveChargingSession {
-                        generation,
-                        session: data.get_live_session_data.map(Box::new),
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Live session: {e}"),
-                    });
-                }
-            }
-        });
+        self.spawn_query::<LiveSessionData, _>(
+            self.charging_url.clone(),
+            "getLiveSessionData",
+            queries::GET_LIVE_CHARGING_SESSION,
+            Some(vars),
+            ErrorSource::LiveSession,
+            |generation, data| AppEvent::LiveChargingSession {
+                generation,
+                session: data.get_live_session_data.map(Box::new),
+            },
+        );
     }
 
     /// Fetch the current live charging session's power history. This is a
@@ -993,42 +1113,18 @@ impl App {
         let Some(tokens) = &self.tokens else {
             return;
         };
-        let vehicle_id = tokens.vehicle_id.clone();
-        let headers = authenticated_headers(tokens);
-        let tx = self.event_tx.clone();
-        let http = self.http_client.clone();
-        let debug = self.debug;
-        let generation = self.generation;
-
-        tokio::spawn(async move {
-            let client = Self::make_client(http, debug, &tx, generation);
-
-            let vars = serde_json::json!({ "vehicleId": vehicle_id });
-            let result: Result<LiveSessionHistoryData, _> = client
-                .graphql(
-                    CHARGING_URL,
-                    "getLiveSessionHistory",
-                    queries::GET_LIVE_CHARGING_HISTORY,
-                    Some(vars),
-                    Some(headers),
-                )
-                .await;
-
-            match result {
-                Ok(data) => {
-                    let _ = tx.send(AppEvent::LiveChargingHistory {
-                        generation,
-                        history: data.get_live_session_history,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Live charge history: {e}"),
-                    });
-                }
-            }
-        });
+        let vars = serde_json::json!({ "vehicleId": tokens.vehicle_id });
+        self.spawn_query::<LiveSessionHistoryData, _>(
+            self.charging_url.clone(),
+            "getLiveSessionHistory",
+            queries::GET_LIVE_CHARGING_HISTORY,
+            Some(vars),
+            ErrorSource::LiveHistory,
+            |generation, data| AppEvent::LiveChargingHistory {
+                generation,
+                history: data.get_live_session_history,
+            },
+        );
     }
 
     /// Fetch release-note/detail URLs for the current and available OTA
@@ -1037,43 +1133,18 @@ impl App {
         let Some(tokens) = &self.tokens else {
             return;
         };
-        let vehicle_id = tokens.vehicle_id.clone();
-        let headers = authenticated_headers(tokens);
-        let tx = self.event_tx.clone();
-        let http = self.http_client.clone();
-        let debug = self.debug;
-        let generation = self.generation;
-
-        tokio::spawn(async move {
-            let client = Self::make_client(http, debug, &tx, generation);
-
-            let vars = serde_json::json!({ "vehicleId": vehicle_id });
-            let result: Result<OtaDetailsData, _> = client
-                .graphql(
-                    API_URL,
-                    "getOTAUpdateDetails",
-                    queries::GET_OTA_UPDATE_DETAILS,
-                    Some(vars),
-                    Some(headers),
-                )
-                .await;
-
-            match result {
-                Ok(data) => {
-                    let details = data.get_vehicle.map(OtaUpdateDetails::from);
-                    let _ = tx.send(AppEvent::OtaDetails {
-                        generation,
-                        details,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("OTA details: {e}"),
-                    });
-                }
-            }
-        });
+        let vars = serde_json::json!({ "vehicleId": tokens.vehicle_id });
+        self.spawn_query::<OtaDetailsData, _>(
+            self.api_url.clone(),
+            "getOTAUpdateDetails",
+            queries::GET_OTA_UPDATE_DETAILS,
+            Some(vars),
+            ErrorSource::OtaDetails,
+            |generation, data| AppEvent::OtaDetails {
+                generation,
+                details: data.get_vehicle.map(OtaUpdateDetails::from),
+            },
+        );
     }
 
     /// Fetch richer selected-vehicle metadata for labels and web JSON. This
@@ -1083,88 +1154,41 @@ impl App {
             return;
         };
         let vehicle_id = tokens.vehicle_id.clone();
-        let headers = authenticated_headers(tokens);
-        let tx = self.event_tx.clone();
-        let http = self.http_client.clone();
-        let debug = self.debug;
-        let generation = self.generation;
-
-        tokio::spawn(async move {
-            let client = Self::make_client(http, debug, &tx, generation);
-
-            let result: Result<UserInfoData, _> = client
-                .graphql(
-                    API_URL,
-                    "getUserInfo",
-                    queries::GET_USER_INFO,
-                    None,
-                    Some(headers),
-                )
-                .await;
-
-            match result {
-                Ok(data) => {
-                    let metadata = data
-                        .current_user
-                        .vehicles
-                        .iter()
-                        .find(|vehicle| vehicle.id == vehicle_id)
-                        .map(Vehicle::metadata);
-                    let _ = tx.send(AppEvent::VehicleMetadata {
-                        generation,
-                        metadata,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Vehicle metadata: {e}"),
-                    });
-                }
-            }
-        });
+        self.spawn_query::<UserInfoData, _>(
+            self.api_url.clone(),
+            "getUserInfo",
+            queries::GET_USER_INFO,
+            None,
+            ErrorSource::Metadata,
+            move |generation, data| AppEvent::VehicleMetadata {
+                generation,
+                metadata: data
+                    .current_user
+                    .vehicles
+                    .iter()
+                    .find(|vehicle| vehicle.id == vehicle_id)
+                    .map(Vehicle::metadata),
+            },
+        );
     }
 
     /// Fetch charging session history from the charging endpoint
     pub fn fetch_charging_history(&mut self) {
-        let Some(tokens) = &self.tokens else {
+        if self.tokens.is_none() {
             return;
-        };
-        let headers = authenticated_headers(tokens);
-        let tx = self.event_tx.clone();
-        let http = self.http_client.clone();
-        let debug = self.debug;
-        let generation = self.generation;
+        }
         self.log(LogLevel::Info, "Fetching charging history...");
-
-        tokio::spawn(async move {
-            let client = Self::make_client(http, debug, &tx, generation);
-
-            let result: Result<ChargingSessionsData, _> = client
-                .graphql(
-                    CHARGING_URL,
-                    "getCompletedSessionSummaries",
-                    queries::GET_CHARGING_SESSIONS,
-                    None,
-                    Some(headers),
-                )
-                .await;
-
-            match result {
-                Ok(data) => {
-                    let _ = tx.send(AppEvent::ChargingSessions {
-                        generation,
-                        sessions: data.get_completed_session_summaries,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::Error {
-                        generation,
-                        msg: format!("Charging history: {e}"),
-                    });
-                }
-            }
-        });
+        self.spawn_query::<ChargingSessionsData, _>(
+            self.charging_url.clone(),
+            "getCompletedSessionSummaries",
+            queries::GET_CHARGING_SESSIONS,
+            None,
+            ErrorSource::ChargingHistory,
+            |generation, data| AppEvent::ChargingSessions {
+                generation,
+                sessions: data.get_completed_session_summaries,
+            },
+        );
     }
 
     pub fn cancel_auth_flow(&mut self) {
@@ -1214,15 +1238,11 @@ impl App {
                 self.login_error = None;
                 self.login_password.clear();
                 self.login_otp.clear();
-                self.refresh_dashboard_insights();
-                self.fetch_vehicle_metadata();
-                self.fetch_ota_details();
                 self.log(
                     LogLevel::Info,
-                    &format!("Selected vehicle {}", vehicle.name.unwrap_or(vehicle.id)),
+                    &format!("Selected vehicle {}", vehicle.display_name()),
                 );
-                self.poll_vehicle_state();
-                self.fetch_charging_history();
+                self.start_session();
             }
             Err(e) => {
                 self.login_error = Some(format!("Saving vehicle selection failed: {e}"));
@@ -1236,9 +1256,17 @@ impl App {
 
     /// Log out: clear tokens and reset state
     pub fn logout(&mut self) {
-        self.generation += 1;
         let _ = AuthManager::clear_tokens();
+        self.reset_session();
+        self.log(LogLevel::Info, "Logged out");
+    }
+
+    /// Drop every piece of session state and return to the login screen.
+    /// Bumps the generation so any in-flight response is discarded.
+    fn reset_session(&mut self) {
+        self.generation += 1;
         self.tokens = None;
+        self.poll_in_flight = false;
         self.vehicle_state = None;
         self.vehicle_metadata = None;
         self.recent_trend.clear();
@@ -1261,7 +1289,6 @@ impl App {
         self.show_debug_detail = false;
         self.mode = Mode::Login;
         self.sync_shared_data();
-        self.log(LogLevel::Info, "Logged out");
     }
 
     /// Cycle login field focus
@@ -1431,6 +1458,7 @@ mod tests {
         app.event_tx
             .send(AppEvent::Error {
                 generation: app.generation,
+                source: ErrorSource::Poll,
                 msg: "Poll failed: test failure".into(),
             })
             .unwrap();
@@ -1448,5 +1476,139 @@ mod tests {
             .unwrap();
         app.drain_events();
         assert!(app.vehicle_state_error.is_none());
+    }
+
+    fn charging_state(charger_state: &str) -> VehicleStateFields {
+        VehicleStateFields {
+            charger_state: Some(StateValue {
+                value: serde_json::json!(charger_state),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn background_fetch_errors_do_not_touch_login_screen_state() {
+        let mut app = App::new(false, None);
+        app.login_busy = true;
+        app.event_tx
+            .send(AppEvent::Error {
+                generation: app.generation,
+                source: ErrorSource::OtaDetails,
+                msg: "OTA details: boom".into(),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(
+            app.login_error.is_none(),
+            "non-auth errors must not paint the login screen"
+        );
+        assert!(app.login_busy, "non-auth errors must not clear login_busy");
+        assert!(app.vehicle_state_error.is_none());
+        assert!(app.activity_log.iter().any(|e| e.message.contains("boom")));
+    }
+
+    #[test]
+    fn login_errors_still_reach_login_screen() {
+        let mut app = App::new(false, None);
+        app.login_busy = true;
+        app.event_tx
+            .send(AppEvent::Error {
+                generation: app.generation,
+                source: ErrorSource::Login,
+                msg: "Login failed: bad password".into(),
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(
+            app.login_error.as_deref(),
+            Some("Login failed: bad password")
+        );
+        assert!(!app.login_busy);
+    }
+
+    #[test]
+    fn session_expiry_drops_to_login_and_clears_tokens() {
+        let _auth = AuthTestContext::new();
+        let mut app = App::new(false, None);
+        app.tokens = Some(sample_tokens());
+        app.vehicle_state = Some(VehicleStateFields::default());
+        let generation = app.generation;
+
+        app.event_tx
+            .send(AppEvent::SessionExpired { generation })
+            .unwrap();
+        app.drain_events();
+
+        assert_eq!(app.mode, Mode::Login);
+        assert!(app.tokens.is_none());
+        assert!(app.vehicle_state.is_none());
+        assert!(app.login_error.as_deref().unwrap_or("").contains("expired"));
+        assert_ne!(
+            app.generation, generation,
+            "in-flight responses must be invalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_poll_is_skipped_while_first_is_in_flight() {
+        let mut app = App::new(false, None);
+        app.tokens = Some(sample_tokens());
+        // Unroutable local address: the request fails fast without leaving
+        // the machine.
+        app.api_url = "http://127.0.0.1:9/graphql".into();
+
+        assert!(app.poll_vehicle_state(), "first poll should start");
+        assert!(
+            !app.poll_vehicle_state(),
+            "second poll must be skipped while in flight"
+        );
+
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            app.drain_events();
+            if app.vehicle_state_error.is_some() {
+                break;
+            }
+        }
+        assert!(app.vehicle_state_error.is_some(), "poll should have failed");
+        assert!(
+            app.poll_vehicle_state(),
+            "poll must be allowed again after the previous one finished"
+        );
+    }
+
+    #[test]
+    fn ota_details_refresh_only_when_versions_change() {
+        let mut app = App::new(false, None);
+        let mut v1 = charging_state("charging_inactive");
+        v1.ota_current_version = Some(StateValue {
+            value: serde_json::json!("2026.10.0"),
+        });
+        v1.ota_available_version = Some(StateValue {
+            value: serde_json::json!("0.0.0"),
+        });
+
+        // No previous state: start_session already fetched details.
+        assert!(!app.ota_details_need_refresh(&v1));
+
+        app.vehicle_state = Some(v1.clone());
+        // Details never arrived (earlier fetch failed): retry.
+        assert!(app.ota_details_need_refresh(&v1));
+
+        app.ota_update_details = Some(OtaUpdateDetails::default());
+        assert!(
+            !app.ota_details_need_refresh(&v1),
+            "unchanged versions must not refetch"
+        );
+
+        let mut v2 = v1.clone();
+        v2.ota_available_version = Some(StateValue {
+            value: serde_json::json!("2026.12.0"),
+        });
+        assert!(
+            app.ota_details_need_refresh(&v2),
+            "new available version must refetch"
+        );
     }
 }

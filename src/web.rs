@@ -87,10 +87,14 @@ async fn dashboard_html(State(state): State<WebState>) -> Response {
 }
 
 fn current_view(data: &SharedDashboardData) -> Result<DashboardView, String> {
-    let snapshot: DashboardData = data
-        .read()
-        .map_err(|_| "dashboard state lock poisoned".to_string())?
-        .clone();
+    // Clone the Arc, not the data: the read lock is released immediately and
+    // rendering works on an immutable snapshot.
+    let snapshot: std::sync::Arc<DashboardData> = {
+        let guard = data
+            .read()
+            .map_err(|_| "dashboard state lock poisoned".to_string())?;
+        std::sync::Arc::clone(&guard)
+    };
     Ok(DashboardView::from_data(&snapshot))
 }
 

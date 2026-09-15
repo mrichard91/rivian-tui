@@ -19,6 +19,9 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
-keyring = "3"
+# keyring uses an in-process mock store unless a platform backend feature is
+# enabled — without these the OS keychain is never touched and tokens would
+# only survive via the plaintext fallback file.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 rumqttc = "0.24"
 axum = "0.7"

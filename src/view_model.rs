@@ -112,7 +112,7 @@ impl AlertsView {
             &vs.closure_side_bin_right_closed,
             &vs.closure_tonneau_closed,
         ];
-        if door_fields.iter().any(|field| state_is(field, "open")) {
+        if door_fields.iter().any(|field| closure_is_open(field)) {
             push(
                 AlertKind::Closure,
                 AlertSeverity::Critical,
@@ -337,6 +337,14 @@ fn state_is(field: &Option<StateValue>, expected: &str) -> bool {
     normalized_state(field).is_some_and(|state| state == expected)
 }
 
+/// A door/closure field reports something other than shut. The wire uses
+/// `open` and, for the frunk, `ajar`; `signal_not_available` (tonneau on
+/// vehicles without one) normalizes to None and counts as shut. Shared by
+/// the alert strip and the Vehicle-card summary so they can't disagree.
+fn closure_is_open(field: &Option<StateValue>) -> bool {
+    normalized_state(field).is_some_and(|state| matches!(state.as_str(), "open" | "ajar"))
+}
+
 fn flag_is_active(vs: &VehicleStateFields, field: &Option<StateValue>) -> bool {
     vs.get_boolish(field) == Some(true)
         || normalized_state(field).is_some_and(|state| {
@@ -365,9 +373,11 @@ fn state_is_problem(field: &Option<StateValue>) -> bool {
         return false;
     }
 
+    // "empty" is what wiperFluidState actually reports (the API never says
+    // "low" for it).
     matches!(
         state.as_str(),
-        "true" | "1" | "on" | "active" | "detected" | "present" | "low" | "invalid"
+        "true" | "1" | "on" | "active" | "detected" | "present" | "low" | "empty" | "invalid"
     ) || [
         "fault",
         "failure",
@@ -771,7 +781,7 @@ impl VehicleView {
             &vs.closure_side_bin_right_closed,
             &vs.closure_tonneau_closed,
         ];
-        let all_closed = if closures.iter().all(|f| vs.get_boolish(f).unwrap_or(true)) {
+        let all_closed = if closures.iter().all(|f| !closure_is_open(f)) {
             "all closed"
         } else {
             "open"
@@ -1543,5 +1553,31 @@ mod tests {
             !formatted.contains("2026-02-28T"),
             "raw RFC3339 must not leak through, got {formatted}"
         );
+    }
+
+    #[test]
+    fn washer_fluid_empty_raises_fluid_alert() {
+        // The API's only observed non-normal wiperFluidState is "empty"
+        // (8,795 recorded rows), not "low".
+        let vs = VehicleStateFields {
+            wiper_fluid_state: state_value(json!("empty")),
+            ..Default::default()
+        };
+        let alerts = AlertsView::from_state(&vs);
+        assert_eq!(alerts.items.len(), 1, "{:?}", alerts.items);
+        assert_eq!(alerts.items[0].kind, AlertKind::Fluid);
+    }
+
+    #[test]
+    fn ajar_closure_is_reported_open_by_alert_and_summary() {
+        // Observed on the wire for closureFrunkClosed alongside open/closed.
+        let vs = VehicleStateFields {
+            closure_frunk_closed: state_value(json!("ajar")),
+            ..Default::default()
+        };
+        let alerts = AlertsView::from_state(&vs);
+        assert_eq!(alerts.items.len(), 1, "{:?}", alerts.items);
+        assert_eq!(alerts.items[0].message, "Door or hatch open");
+        assert_eq!(VehicleView::from_state(&vs).all_closed, "open");
     }
 }

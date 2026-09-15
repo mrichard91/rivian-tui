@@ -7,7 +7,7 @@ A Rust-based terminal UI dashboard for Rivian vehicles.
 - **TUI**: ratatui 0.29 + crossterm 0.28, immediate-mode rendering at 200ms tick
 - **Async**: tokio with background tasks communicating via unbounded channels
 - **API**: GraphQL queries to Rivian's API (gateway for auth, api.rivian.com for data)
-- **Auth**: OAuth flow with CSRF → Login → MFA(OTP) → token storage in OS keychain (`keyring` crate)
+- **Auth**: OAuth flow with CSRF → Login → MFA(OTP) → token storage in OS keychain (`keyring` crate with the platform backend features enabled — without `apple-native` / `windows-native` / `sync-secret-service` the crate silently uses an in-memory mock and nothing persists). Linux builds need libdbus headers. `~/.config/rivian-tui/tokens.json` is written only if the keychain is unavailable.
 - **Modules**: Flat structure under `src/`, API types in `src/api/`
 
 ## Module layout
@@ -33,6 +33,9 @@ cargo check
 - No secrets in the repo — auth tokens live in the OS keychain
 - Headers mimic the iOS Rivian app for API compatibility
 - Vehicle state fields use `Option<StateValue<T>>` pattern from the GraphQL API
+- Every background fetch goes through `App::spawn_query` (token guard, generation tag, typed `ErrorSource`, session-expiry detection); the post-auth bundle is `App::start_session`
+- Persisted vehicle-state columns live in one table (`db::VEHICLE_STATE_DATA_COLUMNS`) that drives CREATE, migration, and INSERT — add a row there, nowhere else
+- Alert vocabulary: check `rivian.db` for observed tokens (`SELECT col, COUNT(*) ... GROUP BY col`) before adding a predicate; the API says `empty` not `low`, `ajar` as well as `open`, `close` not `closed`
 - Status messages fade after 8 seconds
 - Modal input: Dashboard, Login, MfaPrompt (more coming)
 

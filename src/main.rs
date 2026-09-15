@@ -111,12 +111,7 @@ async fn run_stdout(cli: &Cli) -> Result<()> {
     let headers = authenticated_headers(&tokens);
 
     let (op_name, query_str, variables) = if let Some(custom_query) = &cli.query {
-        // Auto-pass vehicleID variable if query declares it
-        let vars = if custom_query.contains("$vehicleID") {
-            Some(serde_json::json!({ "vehicleID": tokens.vehicle_id }))
-        } else {
-            None
-        };
+        let vars = stdout_variables(custom_query, &tokens.vehicle_id);
         // Extract operation name from query (e.g., "query GetVehicleState(...)" -> "GetVehicleState")
         let op_name = custom_query
             .split_whitespace()
@@ -151,6 +146,20 @@ async fn run_stdout(cli: &Cli) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&result)?);
 
     Ok(())
+}
+
+/// Variables for a `--stdout --query` run. The gateway schema names the
+/// vehicle variable `$vehicleID` and the charging schema `$vehicleId`; inject
+/// whichever the query declares so both endpoints work without typing the
+/// VIN on the command line.
+fn stdout_variables(query: &str, vehicle_id: &str) -> Option<serde_json::Value> {
+    if query.contains("$vehicleID") {
+        Some(serde_json::json!({ "vehicleID": vehicle_id }))
+    } else if query.contains("$vehicleId") {
+        Some(serde_json::json!({ "vehicleId": vehicle_id }))
+    } else {
+        None
+    }
 }
 
 async fn run_tui(
@@ -195,46 +204,31 @@ async fn run_tui(
     app.poll_interval_secs = cli.poll_interval;
     app.try_load_auth();
 
-    // If we loaded tokens, kick off initial fetches
+    // If we loaded tokens, kick off the session bundle. Login and vehicle
+    // selection call the same `start_session` from the event handler, so
+    // there is no separate post-login fetch path here.
     if app.tokens.is_some() {
-        app.fetch_vehicle_metadata();
-        app.fetch_ota_details();
-        app.poll_vehicle_state();
-        app.fetch_charging_history();
+        app.start_session();
     }
 
     let mut last_poll = Instant::now();
     let tick_rate = Duration::from_millis(200);
-    let mut needs_initial_fetch = false;
 
     loop {
         // Draw
         terminal.draw(|f| tui::draw(f, &app))?;
 
         // Drain background events
-        let prev_mode = app.mode.clone();
         app.drain_events();
 
-        // After successful login, trigger initial fetches
-        if prev_mode != Mode::Dashboard && app.mode == Mode::Dashboard && !needs_initial_fetch {
-            needs_initial_fetch = true;
-        }
-
-        if needs_initial_fetch && app.tokens.is_some() {
-            app.fetch_vehicle_metadata();
-            app.fetch_ota_details();
-            app.poll_vehicle_state();
-            app.fetch_charging_history();
-            last_poll = Instant::now();
-            needs_initial_fetch = false;
-        }
-
-        // Auto-poll on interval when authenticated and on dashboard
+        // Auto-poll on interval when authenticated and on dashboard. A poll
+        // already in flight is skipped, so the timer only restarts when a
+        // request actually went out.
         if app.mode == Mode::Dashboard
             && app.tokens.is_some()
             && last_poll.elapsed().as_secs() >= app.poll_interval_secs
+            && app.poll_vehicle_state()
         {
-            app.poll_vehicle_state();
             last_poll = Instant::now();
         }
 
@@ -279,8 +273,11 @@ async fn run_tui(
                                     app.should_quit = true;
                                 }
                                 KeyCode::Char('r') => {
-                                    app.poll_vehicle_state();
-                                    last_poll = Instant::now();
+                                    if app.poll_vehicle_state() {
+                                        last_poll = Instant::now();
+                                    } else if app.tokens.is_some() {
+                                        app.log(LogLevel::Info, "Refresh already in progress");
+                                    }
                                 }
                                 KeyCode::Char('L') => {
                                     app.logout();
@@ -366,4 +363,28 @@ async fn run_tui(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_injects_whichever_vehicle_variable_the_query_declares() {
+        // Gateway queries use `$vehicleID`; charging queries use `$vehicleId`.
+        let gateway = "query Q($vehicleID: String!) { vehicleState(id: $vehicleID) { batteryLevel { value } } }";
+        let charging =
+            "query L($vehicleId: ID!) { getLiveSessionData(vehicleId: $vehicleId) { chargerId } }";
+        let neither = "query getUserInfo { currentUser { vehicles { id } } }";
+
+        assert_eq!(
+            stdout_variables(gateway, "VIN1"),
+            Some(serde_json::json!({ "vehicleID": "VIN1" }))
+        );
+        assert_eq!(
+            stdout_variables(charging, "VIN1"),
+            Some(serde_json::json!({ "vehicleId": "VIN1" }))
+        );
+        assert_eq!(stdout_variables(neither, "VIN1"), None);
+    }
 }

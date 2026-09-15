@@ -71,8 +71,8 @@ All fields return `{ value }` (flexible type — string, number, or bool) unless
 | `chargerStatus` | `"chrgr_sts_not_connected"` | — |
 | `chargerState` | `"charging_ready"`, `"charging_active"` | — |
 | `timeToEndOfCharge` | `0` | minutes |
-| `chargePortState` | `"open"`, `"closed"` | — |
-| `chargerDerateStatus` | `"NONE"` | — |
+| `chargePortState` | `"open"`, `"opening"`, `"close"` (no trailing d) | — |
+| `chargerDerateStatus` | `"NONE"`, `"NEARING_TOC"` (normal taper), `"HVAC_PRIORITIZED"`, `"EVSE_DERATING"`, `"DC_WARM_PLUG"` | — |
 | `remoteChargingAvailable` | `0` | boolean-ish |
 | `batteryHvThermalEvent` | `"off"` | — |
 
@@ -130,7 +130,7 @@ Each has `Closed`/`Locked` variants: `doorFrontLeftClosed`, `doorFrontLeftLocked
 |---------------|---------------|
 | `door{Front,Rear}{Left,Right}Closed` | `"closed"`, `"open"` |
 | `door{Front,Rear}{Left,Right}Locked` | `"locked"`, `"unlocked"` |
-| `closureFrunk{Closed,Locked}` | `"closed"`, `"locked"` |
+| `closureFrunk{Closed,Locked}` | `"closed"`, `"open"`, `"ajar"`, `"locked"` |
 | `closureLiftgate{Closed,Locked}` | `"closed"`, `"signal_not_available"` |
 | `closureTailgate{Closed,Locked}` | `"closed"` |
 | `closureSideBin{Left,Right}Closed` | `"closed"` |
@@ -143,7 +143,7 @@ Each has `Closed`/`Locked` variants: `doorFrontLeftClosed`, `doorFrontLeftLocked
 | `window{Front,Rear}{Left,Right}Calibrated` | calibration status |
 | `windowsNextAction` | — |
 
-#### Tires (status only, no PSI values)
+#### Tires (status only over polling; numeric PSI is subscription-only)
 | Field | Values |
 |-------|--------|
 | `tirePressureStatus{Front,Rear}{Left,Right}` | `"OK"`, `"Low"` |
@@ -158,7 +158,7 @@ Each has `Closed`/`Locked` variants: `doorFrontLeftClosed`, `doorFrontLeftLocked
 | `gearGuardVideoStatus` | `"Enabled"` |
 | `gearGuardVideoMode` | `"Away_From_Home"` |
 | `alarmSoundStatus` | `"false"` |
-| `wiperFluidState` | `"normal"` |
+| `wiperFluidState` | `"normal"`, `"empty"` (never `"low"`) |
 | `limitedAccelCold` | `1` (boolean-ish) |
 | `limitedRegenCold` | `1` |
 | `twelveVoltBatteryHealth` | `"NORMAL_OPERATION"` |
@@ -225,7 +225,17 @@ cargo run -- --stdout --endpoint charging --query "query getCompletedSessionSumm
 
 # Vehicle state with specific fields
 cargo run -- --stdout --query 'query GetVehicleState($vehicleID: String!) { vehicleState(id: $vehicleID) { batteryLevel { value } otaCurrentVersion { value } } }'
+
+# Live charging session (charging endpoint uses $vehicleId, injected automatically)
+cargo run -- --stdout --endpoint charging --query 'query getLiveSessionData($vehicleId: ID!) { getLiveSessionData(vehicleId: $vehicleId) { chargerId power { value } } }'
 ```
+
+## Error handling
+
+- A response with both `data` and `errors` is a **partial** response (a field the model
+  lacks). The client keeps `data` and logs the errors as warnings.
+- HTTP 401 or a GraphQL error with `extensions.code == "UNAUTHENTICATED"` means the saved
+  session is dead; the app clears tokens and returns to the login screen.
 
 ## Notes
 
@@ -233,5 +243,6 @@ cargo run -- --stdout --query 'query GetVehicleState($vehicleID: String!) { vehi
 - `vehicleMileage` is in **meters**, `distanceToEmpty` is in **km**
 - `cabinClimateInteriorTemperature` is in **Celsius**
 - No trip/driving history API exists
-- No actual tire pressure PSI values — only status (`OK`/`Low`)
+- Numeric tire PSI is only delivered over the websocket subscription; polling gets status enums only
+- A charging-schedule *read* query exists: `getVehicleChargingSchedules` (see docs/GRAPHQL_FIELD_OPPORTUNITIES.md)
 - WebSocket subscriptions available for real-time vehicle state updates
