@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod config;
 mod db;
+mod dayboard;
 mod mqtt;
 mod tui;
 mod view_model;

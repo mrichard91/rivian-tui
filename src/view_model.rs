@@ -17,6 +17,7 @@ use crate::db::{ChargeSessionSummary, ChargingStats, Trip, VehicleTrendPoint};
 /// A flat, pre-formatted view of the dashboard intended for HTML/JSON output.
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardView {
+    pub dayboard: Option<serde_json::Value>,
     pub vehicle_id: Option<String>,
     pub vehicle_label: String,
     pub vehicle_metadata: Option<VehicleMetadataView>,
@@ -615,6 +616,7 @@ impl DashboardView {
             };
 
         Self {
+            dayboard: crate::dayboard::details(data),
             vehicle_id: data.vehicle_id.clone(),
             vehicle_label: data
                 .vehicle_metadata
@@ -771,10 +773,12 @@ impl VehicleView {
             &vs.closure_side_bin_right_closed,
             &vs.closure_tonneau_closed,
         ];
-        let all_closed = if closures.iter().all(|f| vs.get_boolish(f).unwrap_or(true)) {
+        let all_closed = if closures.iter().any(|f| crate::dayboard::closure_state(f) == "open") {
+            "open"
+        } else if closures.iter().all(|f| crate::dayboard::closure_state(f) == "closed") {
             "all closed"
         } else {
-            "open"
+            "unknown"
         };
 
         Self {
