@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod mqtt;
 mod tui;
+mod vehicle_art;
 mod view_model;
 mod web;
 

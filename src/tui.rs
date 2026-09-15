@@ -3,6 +3,7 @@ use ratatui::widgets::*;
 
 use crate::api::types::{KM_PER_MI, METERS_PER_MI};
 use crate::app::{App, LogLevel, LoginField, Mode};
+use crate::vehicle_art::R1tArt;
 use crate::view_model::{
     humanize_iso_local, AlertSeverity, AlertsView, ChargeInsightView, ChargingStatsView,
     LiveChargeHistoryView, LiveChargeView, SoftwareView, TripView, VehicleMetadataView,
@@ -105,14 +106,6 @@ fn bool_badge(flag: Option<bool>, true_label: &str, false_label: &str) -> (Strin
 fn tagged_value(tag: &str, value: &str, color: Color) -> (String, Color) {
     (format!("{tag}:{value}"), color)
 }
-
-const R1T_ART: [&str; 5] = [
-    "      .-~~~~~~~~~~~~-.      ",
-    "   .-'                '-.   ",
-    "  /   (|)==========(|)   \\  ",
-    " |_____|            |_____| ",
-    " '----/______________\\----' ",
-];
 
 /// Main draw dispatcher
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -396,13 +389,6 @@ fn draw_col_vehicle(
     vs: &crate::api::types::VehicleStateFields,
 ) {
     const VW: usize = 10;
-    let show_art = area.width >= 30 && area.height >= 16;
-    let sections = if show_art {
-        Layout::vertical([Constraint::Length(7), Constraint::Min(8)]).split(area)
-    } else {
-        Layout::vertical([Constraint::Min(8)]).split(area)
-    };
-
     let power = vs.power_state_str();
     let power_color = if power == "ready" || power == "go" {
         Color::Green
@@ -484,42 +470,35 @@ fn draw_col_vehicle(
         kv(VW, "Cold", &cold_str, cold_color),
     ]);
 
-    if show_art {
-        let art: Vec<Line> = R1T_ART
-            .iter()
-            .map(|line| {
-                Line::from(Span::styled(
-                    *line,
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            })
-            .collect();
+    // One border gives the truck enough room at 120 × 40 while retaining every
+    // vehicle row. On smaller screens the information keeps priority.
+    let panel = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Vehicle ");
+    let inner = panel.inner(area);
+    frame.render_widget(panel, area);
 
+    let is_r1t = app
+        .vehicle_metadata
+        .as_ref()
+        .and_then(|meta| meta.model.as_deref())
+        .is_none_or(|model| model.eq_ignore_ascii_case("R1T"));
+    let art = is_r1t
+        .then(|| R1tArt::fit(inner.width, inner.height.saturating_sub(lines.len() as u16)))
+        .flatten();
+    let mut info = inner;
+    if let Some(art) = art {
+        let art_area = Rect::new(inner.x, inner.y, inner.width, art.height);
         frame.render_widget(
-            Paragraph::new(art).alignment(Alignment::Center).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(
-                        metadata
-                            .as_ref()
-                            .map(|meta| format!(" {} ", meta.model))
-                            .unwrap_or_else(|| " R1T ".into()),
-                    ),
-            ),
-            sections[0],
+            Block::default().style(Style::default().bg(crate::vehicle_art::BACKGROUND)),
+            art_area,
         );
+        frame.render_widget(art, art_area);
+        info.y += art.height;
+        info.height -= art.height;
     }
-
-    let panel = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" Vehicle "),
-    );
-    frame.render_widget(panel, sections[sections.len() - 1]);
+    frame.render_widget(Paragraph::new(lines), info);
 }
 
 /// Right column: doors, tires, OTA, status
@@ -1548,5 +1527,89 @@ mod tests {
         assert_eq!(charge_port_color("opening"), Color::Yellow);
         assert_eq!(charge_port_color("close"), Color::Green);
         assert_eq!(charge_port_color("unknown"), Color::DarkGray);
+    }
+}
+
+#[cfg(test)]
+mod art_layout_tests {
+    use super::*;
+    use crate::api::types::{VehicleMetadata, VehicleStateFields};
+    use ratatui::backend::TestBackend;
+
+    fn preview_app(model: &str) -> App {
+        let mut app = App::new(false, None);
+        app.vehicle_metadata = Some(VehicleMetadata {
+            model: Some(model.into()),
+            model_year: Some(2025),
+            display_name: "R1T".into(),
+            trim: Some("Adventure".into()),
+            exterior_color: Some("Forest Green".into()),
+            ..Default::default()
+        });
+        app.vehicle_state = Some(serde_json::from_str::<VehicleStateFields>("{}").unwrap());
+        app
+    }
+
+    #[test]
+    fn truck_does_not_displace_vehicle_information() {
+        let app = preview_app("R1T");
+        for (width, height, expected_art) in [
+            (40, 27, true),
+            (54, 35, true),
+            (40, 20, false),
+            (28, 27, false),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_col_vehicle(
+                        frame,
+                        frame.area(),
+                        &app,
+                        app.vehicle_state.as_ref().unwrap(),
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            for label in [
+                "Name", "Model", "Trim", "Color", "Power", "Gear", "Mode", "Odometer", "Cabin",
+                "Climate", "Defrost", "Seats F", "Seats R", "Vent", "Wheel", "Cold",
+            ] {
+                assert!(
+                    text.contains(label),
+                    "{label} missing at {width} × {height}"
+                );
+            }
+            assert_eq!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.bg == crate::vehicle_art::BACKGROUND),
+                expected_art
+            );
+        }
+    }
+
+    #[test]
+    fn other_models_do_not_get_a_pickup_illustration() {
+        let app = preview_app("R1S");
+        let mut terminal = Terminal::new(TestBackend::new(54, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_col_vehicle(
+                    frame,
+                    frame.area(),
+                    &app,
+                    app.vehicle_state.as_ref().unwrap(),
+                )
+            })
+            .unwrap();
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.bg == crate::vehicle_art::BACKGROUND));
     }
 }
