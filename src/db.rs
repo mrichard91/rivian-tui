@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::api::types::{
-    ChargingSession, LiveChargingSession, VehicleStateFields, KM_PER_MI, METERS_PER_MI,
+    ChargingSession, LiveChargingSession, StateValue, VehicleStateFields, KM_PER_MI, METERS_PER_MI,
 };
 
 const DB_NAME: &str = "rivian.db";
@@ -219,101 +219,325 @@ fn charging_session_dedupe_key(session: &ChargingSession) -> String {
     )
 }
 
+/// SQL value extracted from a vehicle-state snapshot for one column.
+type ColumnExtractor = fn(&VehicleStateFields) -> rusqlite::types::Value;
+
+/// One column of the `vehicle_state` table: name, SQL type, and how to pull
+/// its value out of a snapshot.
+struct VehicleStateColumn {
+    name: &'static str,
+    sql_type: &'static str,
+    extract: ColumnExtractor,
+}
+
+const fn col(
+    name: &'static str,
+    sql_type: &'static str,
+    extract: ColumnExtractor,
+) -> VehicleStateColumn {
+    VehicleStateColumn {
+        name,
+        sql_type,
+        extract,
+    }
+}
+
+/// Display-string form of a `{ value }` field, or SQL NULL.
+fn text(field: &Option<StateValue>) -> rusqlite::types::Value {
+    match field {
+        Some(v) => rusqlite::types::Value::Text(v.to_display()),
+        None => rusqlite::types::Value::Null,
+    }
+}
+
+/// Numeric form of a `{ value }` field (number or numeric string), or NULL.
+fn real(field: &Option<StateValue>) -> rusqlite::types::Value {
+    match field.as_ref().and_then(|v| v.as_f64()) {
+        Some(n) => rusqlite::types::Value::Real(n),
+        None => rusqlite::types::Value::Null,
+    }
+}
+
+fn opt_real(value: Option<f64>) -> rusqlite::types::Value {
+    value.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Real)
+}
+
+fn opt_text(value: Option<String>) -> rusqlite::types::Value {
+    value.map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text)
+}
+
 /// Canonical schema for the `vehicle_state` data columns (everything except
-/// the fixed id/ts/vehicle_id prefix). This single list drives BOTH the
-/// CREATE TABLE for new databases AND the migration backfill for existing
-/// ones — the previous design kept a separate hand-maintained ALTER list,
-/// which drifted: the door/closure "closed" columns were never added to it,
-/// so legacy databases rejected every snapshot insert ("no column named
-/// door_fl_closed") and silently stopped recording history.
-const VEHICLE_STATE_DATA_COLUMNS: &[(&str, &str)] = &[
+/// the fixed id/ts/vehicle_id prefix). This single table drives the CREATE
+/// TABLE for new databases, the migration backfill for existing ones, AND
+/// the INSERT statement — so a column can't be declared without being
+/// written, or written without being declared. (An earlier design kept the
+/// INSERT column list by hand and it drifted: door/closure columns were
+/// declared but never added to legacy databases, and a dozen fetched
+/// diagnostic fields were never written at all.)
+const VEHICLE_STATE_DATA_COLUMNS: &[VehicleStateColumn] = &[
     // power & drive
-    ("power_state", "TEXT"),
-    ("drive_mode", "TEXT"),
-    ("gear_status", "TEXT"),
-    ("vehicle_mileage_m", "REAL"),
+    col("power_state", "TEXT", |vs| text(&vs.power_state)),
+    col("drive_mode", "TEXT", |vs| text(&vs.drive_mode)),
+    col("gear_status", "TEXT", |vs| text(&vs.gear_status)),
+    col("vehicle_mileage_m", "REAL", |vs| real(&vs.vehicle_mileage)),
     // battery & charging
-    ("battery_level", "REAL"),
-    ("battery_limit", "REAL"),
-    ("battery_capacity", "REAL"),
-    ("distance_to_empty_km", "REAL"),
-    ("charger_status", "TEXT"),
-    ("charger_state", "TEXT"),
-    ("time_to_end_of_charge", "REAL"),
-    ("charge_port_state", "TEXT"),
-    ("charger_derate", "TEXT"),
-    ("remote_charging_available", "REAL"),
-    ("battery_hv_thermal", "TEXT"),
+    col("battery_level", "REAL", |vs| real(&vs.battery_level)),
+    col("battery_limit", "REAL", |vs| real(&vs.battery_limit)),
+    col("battery_capacity", "REAL", |vs| real(&vs.battery_capacity)),
+    col("distance_to_empty_km", "REAL", |vs| {
+        real(&vs.distance_to_empty)
+    }),
+    col("charger_status", "TEXT", |vs| text(&vs.charger_status)),
+    col("charger_state", "TEXT", |vs| text(&vs.charger_state)),
+    col("time_to_end_of_charge", "REAL", |vs| {
+        real(&vs.time_to_end_of_charge)
+    }),
+    col("charge_port_state", "TEXT", |vs| {
+        text(&vs.charge_port_state)
+    }),
+    col("charger_derate", "TEXT", |vs| {
+        text(&vs.charger_derate_status)
+    }),
+    col("remote_charging_available", "REAL", |vs| {
+        real(&vs.remote_charging_available)
+    }),
+    col("battery_hv_thermal", "TEXT", |vs| {
+        text(&vs.battery_hv_thermal_event)
+    }),
+    col("battery_hv_thermal_propagation", "TEXT", |vs| {
+        text(&vs.battery_hv_thermal_event_propagation)
+    }),
+    col("battery_needs_lfp_calibration", "TEXT", |vs| {
+        text(&vs.battery_needs_lfp_calibration)
+    }),
+    col("charging_disabled_all", "TEXT", |vs| {
+        text(&vs.charging_disabled_all)
+    }),
     // climate
-    ("cabin_temp_c", "REAL"),
-    ("driver_temp_c", "REAL"),
-    ("cabin_preconditioning", "TEXT"),
-    ("preconditioning_type", "TEXT"),
-    ("defrost_defog", "TEXT"),
-    ("seat_heat_fl", "TEXT"),
-    ("seat_heat_fr", "TEXT"),
-    ("seat_heat_rl", "TEXT"),
-    ("seat_heat_rr", "TEXT"),
-    ("seat_vent_fl", "TEXT"),
-    ("seat_vent_fr", "TEXT"),
-    ("steering_wheel_heat", "TEXT"),
+    col("cabin_temp_c", "REAL", |vs| {
+        real(&vs.cabin_climate_interior_temperature)
+    }),
+    col("driver_temp_c", "REAL", |vs| {
+        real(&vs.cabin_climate_driver_temperature)
+    }),
+    col("cabin_preconditioning", "TEXT", |vs| {
+        text(&vs.cabin_preconditioning_status)
+    }),
+    col("preconditioning_type", "TEXT", |vs| {
+        text(&vs.cabin_preconditioning_type)
+    }),
+    col("defrost_defog", "TEXT", |vs| text(&vs.defrost_defog_status)),
+    col("seat_heat_fl", "TEXT", |vs| text(&vs.seat_front_left_heat)),
+    col("seat_heat_fr", "TEXT", |vs| text(&vs.seat_front_right_heat)),
+    col("seat_heat_rl", "TEXT", |vs| text(&vs.seat_rear_left_heat)),
+    col("seat_heat_rr", "TEXT", |vs| text(&vs.seat_rear_right_heat)),
+    col("seat_vent_fl", "TEXT", |vs| text(&vs.seat_front_left_vent)),
+    col("seat_vent_fr", "TEXT", |vs| text(&vs.seat_front_right_vent)),
+    col("steering_wheel_heat", "TEXT", |vs| {
+        text(&vs.steering_wheel_heat)
+    }),
     // location
-    ("latitude", "REAL"),
-    ("longitude", "REAL"),
-    ("speed", "REAL"),
-    ("altitude", "REAL"),
-    ("bearing", "REAL"),
+    col("latitude", "REAL", |vs| {
+        opt_real(vs.gnss_location.as_ref().and_then(|g| g.latitude))
+    }),
+    col("longitude", "REAL", |vs| {
+        opt_real(vs.gnss_location.as_ref().and_then(|g| g.longitude))
+    }),
+    col("speed", "REAL", |vs| real(&vs.gnss_speed)),
+    col("altitude", "REAL", |vs| real(&vs.gnss_altitude)),
+    col("bearing", "REAL", |vs| real(&vs.gnss_bearing)),
     // connectivity
-    ("last_sync", "TEXT"),
+    col("last_sync", "TEXT", |vs| {
+        opt_text(
+            vs.cloud_connection
+                .as_ref()
+                .and_then(|c| c.last_sync.clone()),
+        )
+    }),
     // OTA
-    ("ota_current", "TEXT"),
-    ("ota_available", "TEXT"),
-    ("ota_status", "TEXT"),
-    ("ota_current_status", "TEXT"),
-    ("ota_download_progress", "REAL"),
-    ("ota_install_progress", "REAL"),
-    ("ota_install_ready", "TEXT"),
+    col("ota_current", "TEXT", |vs| text(&vs.ota_current_version)),
+    col("ota_available", "TEXT", |vs| {
+        text(&vs.ota_available_version)
+    }),
+    col("ota_status", "TEXT", |vs| text(&vs.ota_status)),
+    col("ota_current_status", "TEXT", |vs| {
+        text(&vs.ota_current_status)
+    }),
+    col("ota_download_progress", "REAL", |vs| {
+        real(&vs.ota_download_progress)
+    }),
+    col("ota_install_progress", "REAL", |vs| {
+        real(&vs.ota_install_progress)
+    }),
+    col("ota_install_ready", "TEXT", |vs| {
+        text(&vs.ota_install_ready)
+    }),
+    col("ota_current_version_number", "REAL", |vs| {
+        real(&vs.ota_current_version_number)
+    }),
+    col("ota_available_version_number", "REAL", |vs| {
+        real(&vs.ota_available_version_number)
+    }),
+    col("ota_current_git_hash", "TEXT", |vs| {
+        text(&vs.ota_current_version_git_hash)
+    }),
+    col("ota_available_git_hash", "TEXT", |vs| {
+        text(&vs.ota_available_version_git_hash)
+    }),
+    col("ota_current_week", "REAL", |vs| {
+        real(&vs.ota_current_version_week)
+    }),
+    col("ota_current_year", "REAL", |vs| {
+        real(&vs.ota_current_version_year)
+    }),
+    col("ota_available_week", "REAL", |vs| {
+        real(&vs.ota_available_version_week)
+    }),
+    col("ota_available_year", "REAL", |vs| {
+        real(&vs.ota_available_version_year)
+    }),
+    col("ota_install_type", "TEXT", |vs| text(&vs.ota_install_type)),
+    col("ota_install_duration", "REAL", |vs| {
+        real(&vs.ota_install_duration)
+    }),
+    col("ota_install_time", "TEXT", |vs| text(&vs.ota_install_time)),
     // doors (closed + locked)
-    ("door_fl_closed", "TEXT"),
-    ("door_fr_closed", "TEXT"),
-    ("door_rl_closed", "TEXT"),
-    ("door_rr_closed", "TEXT"),
-    ("door_fl_locked", "TEXT"),
-    ("door_fr_locked", "TEXT"),
-    ("door_rl_locked", "TEXT"),
-    ("door_rr_locked", "TEXT"),
-    ("frunk_closed", "TEXT"),
-    ("frunk_locked", "TEXT"),
-    ("liftgate_closed", "TEXT"),
-    ("liftgate_locked", "TEXT"),
-    ("tailgate_closed", "TEXT"),
-    ("tailgate_locked", "TEXT"),
-    ("side_bin_l", "TEXT"),
-    ("side_bin_r", "TEXT"),
+    col("door_fl_closed", "TEXT", |vs| {
+        text(&vs.door_front_left_closed)
+    }),
+    col("door_fr_closed", "TEXT", |vs| {
+        text(&vs.door_front_right_closed)
+    }),
+    col("door_rl_closed", "TEXT", |vs| {
+        text(&vs.door_rear_left_closed)
+    }),
+    col("door_rr_closed", "TEXT", |vs| {
+        text(&vs.door_rear_right_closed)
+    }),
+    col("door_fl_locked", "TEXT", |vs| {
+        text(&vs.door_front_left_locked)
+    }),
+    col("door_fr_locked", "TEXT", |vs| {
+        text(&vs.door_front_right_locked)
+    }),
+    col("door_rl_locked", "TEXT", |vs| {
+        text(&vs.door_rear_left_locked)
+    }),
+    col("door_rr_locked", "TEXT", |vs| {
+        text(&vs.door_rear_right_locked)
+    }),
+    col("frunk_closed", "TEXT", |vs| text(&vs.closure_frunk_closed)),
+    col("frunk_locked", "TEXT", |vs| text(&vs.closure_frunk_locked)),
+    col("liftgate_closed", "TEXT", |vs| {
+        text(&vs.closure_liftgate_closed)
+    }),
+    col("liftgate_locked", "TEXT", |vs| {
+        text(&vs.closure_liftgate_locked)
+    }),
+    col("tailgate_closed", "TEXT", |vs| {
+        text(&vs.closure_tailgate_closed)
+    }),
+    col("tailgate_locked", "TEXT", |vs| {
+        text(&vs.closure_tailgate_locked)
+    }),
+    col("side_bin_l", "TEXT", |vs| {
+        text(&vs.closure_side_bin_left_closed)
+    }),
+    col("side_bin_r", "TEXT", |vs| {
+        text(&vs.closure_side_bin_right_closed)
+    }),
+    col("tonneau_closed", "TEXT", |vs| {
+        text(&vs.closure_tonneau_closed)
+    }),
     // windows
-    ("window_fl", "TEXT"),
-    ("window_fr", "TEXT"),
-    ("window_rl", "TEXT"),
-    ("window_rr", "TEXT"),
+    col("window_fl", "TEXT", |vs| text(&vs.window_front_left_closed)),
+    col("window_fr", "TEXT", |vs| {
+        text(&vs.window_front_right_closed)
+    }),
+    col("window_rl", "TEXT", |vs| text(&vs.window_rear_left_closed)),
+    col("window_rr", "TEXT", |vs| text(&vs.window_rear_right_closed)),
+    col("window_fl_calibrated", "TEXT", |vs| {
+        text(&vs.window_front_left_calibrated)
+    }),
+    col("window_fr_calibrated", "TEXT", |vs| {
+        text(&vs.window_front_right_calibrated)
+    }),
+    col("window_rl_calibrated", "TEXT", |vs| {
+        text(&vs.window_rear_left_calibrated)
+    }),
+    col("window_rr_calibrated", "TEXT", |vs| {
+        text(&vs.window_rear_right_calibrated)
+    }),
     // tires
-    ("tire_fl", "TEXT"),
-    ("tire_fr", "TEXT"),
-    ("tire_rl", "TEXT"),
-    ("tire_rr", "TEXT"),
+    col("tire_fl", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_front_left)
+    }),
+    col("tire_fr", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_front_right)
+    }),
+    col("tire_rl", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_rear_left)
+    }),
+    col("tire_rr", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_rear_right)
+    }),
+    col("tire_valid_fl", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_valid_front_left)
+    }),
+    col("tire_valid_fr", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_valid_front_right)
+    }),
+    col("tire_valid_rl", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_valid_rear_left)
+    }),
+    col("tire_valid_rr", "TEXT", |vs| {
+        text(&vs.tire_pressure_status_valid_rear_right)
+    }),
     // security & misc
-    ("pet_mode", "TEXT"),
-    ("pet_mode_temp", "TEXT"),
-    ("gear_guard", "TEXT"),
-    ("gear_guard_video", "TEXT"),
-    ("gear_guard_video_mode", "TEXT"),
-    ("alarm_status", "TEXT"),
-    ("wiper_fluid", "TEXT"),
-    ("limited_accel_cold", "REAL"),
-    ("limited_regen_cold", "REAL"),
-    ("twelve_v_health", "TEXT"),
-    ("service_mode", "TEXT"),
-    ("trailer_status", "TEXT"),
-    ("car_wash_mode", "TEXT"),
+    col("pet_mode", "TEXT", |vs| text(&vs.pet_mode_status)),
+    col("pet_mode_temp", "TEXT", |vs| {
+        text(&vs.pet_mode_temperature_status)
+    }),
+    col("gear_guard", "TEXT", |vs| text(&vs.gear_guard_locked)),
+    col("gear_guard_video", "TEXT", |vs| {
+        text(&vs.gear_guard_video_status)
+    }),
+    col("gear_guard_video_mode", "TEXT", |vs| {
+        text(&vs.gear_guard_video_mode)
+    }),
+    col("alarm_status", "TEXT", |vs| text(&vs.alarm_sound_status)),
+    col("wiper_fluid", "TEXT", |vs| text(&vs.wiper_fluid_state)),
+    col("brake_fluid_low", "TEXT", |vs| text(&vs.brake_fluid_low)),
+    col("limited_accel_cold", "REAL", |vs| {
+        real(&vs.limited_accel_cold)
+    }),
+    col("limited_regen_cold", "REAL", |vs| {
+        real(&vs.limited_regen_cold)
+    }),
+    col("twelve_v_health", "TEXT", |vs| {
+        text(&vs.twelve_volt_battery_health)
+    }),
+    col("btm_ff_failure", "TEXT", |vs| {
+        text(&vs.btm_ff_hardware_failure_status)
+    }),
+    col("btm_ic_failure", "TEXT", |vs| {
+        text(&vs.btm_ic_hardware_failure_status)
+    }),
+    col("btm_lfd_failure", "TEXT", |vs| {
+        text(&vs.btm_lfd_hardware_failure_status)
+    }),
+    col("btm_oc_failure", "TEXT", |vs| {
+        text(&vs.btm_oc_hardware_failure_status)
+    }),
+    col("btm_rfd_failure", "TEXT", |vs| {
+        text(&vs.btm_rfd_hardware_failure_status)
+    }),
+    col("btm_rf_failure", "TEXT", |vs| {
+        text(&vs.btm_rf_hardware_failure_status)
+    }),
+    col("service_mode", "TEXT", |vs| text(&vs.service_mode)),
+    col("trailer_status", "TEXT", |vs| text(&vs.trailer_status)),
+    col("car_wash_mode", "TEXT", |vs| text(&vs.car_wash_mode)),
 ];
 
 impl Db {
@@ -340,7 +564,7 @@ impl Db {
     fn migrate(&self) -> Result<()> {
         let vehicle_state_cols = VEHICLE_STATE_DATA_COLUMNS
             .iter()
-            .map(|(name, ty)| format!("                {name} {ty}"))
+            .map(|c| format!("                {} {}", c.name, c.sql_type))
             .collect::<Vec<_>>()
             .join(",\n");
 
@@ -413,10 +637,12 @@ impl Db {
             .prepare("SELECT name FROM pragma_table_info('vehicle_state')")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<_>>()?;
-        for (name, ty) in VEHICLE_STATE_DATA_COLUMNS {
-            if !existing.contains(*name) {
-                self.conn
-                    .execute_batch(&format!("ALTER TABLE vehicle_state ADD COLUMN {name} {ty}"))?;
+        for c in VEHICLE_STATE_DATA_COLUMNS {
+            if !existing.contains(c.name) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE vehicle_state ADD COLUMN {} {}",
+                    c.name, c.sql_type
+                ))?;
             }
         }
 
@@ -462,97 +688,28 @@ impl Db {
         Ok(())
     }
 
-    /// Insert a vehicle state snapshot. Returns the row id.
+    /// Insert a vehicle state snapshot. Returns the row id. Column list and
+    /// values are both generated from `VEHICLE_STATE_DATA_COLUMNS`.
     pub fn insert_state(&self, vehicle_id: &str, vs: &VehicleStateFields) -> Result<i64> {
-        let sv = |f: &Option<crate::api::types::StateValue>| -> Option<String> {
-            f.as_ref().map(|v| v.to_display())
-        };
-        let fv = |f: &Option<crate::api::types::StateValue>| -> Option<f64> {
-            f.as_ref().and_then(|v| v.as_f64())
-        };
+        let names = VEHICLE_STATE_DATA_COLUMNS
+            .iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (0..VEHICLE_STATE_DATA_COLUMNS.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql =
+            format!("INSERT INTO vehicle_state (vehicle_id, {names}) VALUES (?1, {placeholders})");
 
-        let (lat, lon) = vs
-            .gnss_location
-            .as_ref()
-            .map(|g| (g.latitude, g.longitude))
-            .unwrap_or((None, None));
+        let mut params: Vec<rusqlite::types::Value> =
+            Vec::with_capacity(VEHICLE_STATE_DATA_COLUMNS.len() + 1);
+        params.push(rusqlite::types::Value::Text(vehicle_id.to_string()));
+        params.extend(VEHICLE_STATE_DATA_COLUMNS.iter().map(|c| (c.extract)(vs)));
 
-        let last_sync = vs
-            .cloud_connection
-            .as_ref()
-            .and_then(|c| c.last_sync.clone());
-
-        self.conn.execute(
-            "INSERT INTO vehicle_state (
-                vehicle_id,
-                power_state, drive_mode, gear_status, vehicle_mileage_m,
-                battery_level, battery_limit, battery_capacity, distance_to_empty_km,
-                charger_status, charger_state, time_to_end_of_charge,
-                charge_port_state, charger_derate, remote_charging_available, battery_hv_thermal,
-                cabin_temp_c, driver_temp_c, cabin_preconditioning, preconditioning_type, defrost_defog,
-                seat_heat_fl, seat_heat_fr, seat_heat_rl, seat_heat_rr,
-                seat_vent_fl, seat_vent_fr, steering_wheel_heat,
-                latitude, longitude, speed, altitude, bearing, last_sync,
-                ota_current, ota_available, ota_status, ota_current_status,
-                ota_download_progress, ota_install_progress, ota_install_ready,
-                door_fl_closed, door_fr_closed, door_rl_closed, door_rr_closed,
-                door_fl_locked, door_fr_locked, door_rl_locked, door_rr_locked,
-                frunk_closed, frunk_locked, liftgate_closed, liftgate_locked,
-                tailgate_closed, tailgate_locked, side_bin_l, side_bin_r,
-                window_fl, window_fr, window_rl, window_rr,
-                tire_fl, tire_fr, tire_rl, tire_rr,
-                pet_mode, pet_mode_temp, gear_guard, gear_guard_video, gear_guard_video_mode,
-                alarm_status, wiper_fluid,
-                limited_accel_cold, limited_regen_cold, twelve_v_health,
-                service_mode, trailer_status, car_wash_mode
-            ) VALUES (
-                ?1,
-                ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16,
-                ?17, ?18, ?19, ?20, ?21,
-                ?22, ?23, ?24, ?25,
-                ?26, ?27, ?28,
-                ?29, ?30, ?31, ?32, ?33, ?34,
-                ?35, ?36, ?37, ?38,
-                ?39, ?40, ?41,
-                ?42, ?43, ?44, ?45,
-                ?46, ?47, ?48, ?49,
-                ?50, ?51, ?52, ?53,
-                ?54, ?55, ?56, ?57,
-                ?58, ?59, ?60, ?61,
-                ?62, ?63, ?64, ?65,
-                ?66, ?67, ?68, ?69, ?70,
-                ?71, ?72,
-                ?73, ?74, ?75,
-                ?76, ?77, ?78
-            )",
-            rusqlite::params![
-                vehicle_id,
-                sv(&vs.power_state), sv(&vs.drive_mode), sv(&vs.gear_status), fv(&vs.vehicle_mileage),
-                fv(&vs.battery_level), fv(&vs.battery_limit), fv(&vs.battery_capacity), fv(&vs.distance_to_empty),
-                sv(&vs.charger_status), sv(&vs.charger_state), fv(&vs.time_to_end_of_charge),
-                sv(&vs.charge_port_state), sv(&vs.charger_derate_status), fv(&vs.remote_charging_available), sv(&vs.battery_hv_thermal_event),
-                fv(&vs.cabin_climate_interior_temperature), fv(&vs.cabin_climate_driver_temperature),
-                sv(&vs.cabin_preconditioning_status), sv(&vs.cabin_preconditioning_type), sv(&vs.defrost_defog_status),
-                sv(&vs.seat_front_left_heat), sv(&vs.seat_front_right_heat), sv(&vs.seat_rear_left_heat), sv(&vs.seat_rear_right_heat),
-                sv(&vs.seat_front_left_vent), sv(&vs.seat_front_right_vent), sv(&vs.steering_wheel_heat),
-                lat, lon, fv(&vs.gnss_speed), fv(&vs.gnss_altitude), fv(&vs.gnss_bearing), last_sync,
-                sv(&vs.ota_current_version), sv(&vs.ota_available_version), sv(&vs.ota_status), sv(&vs.ota_current_status),
-                fv(&vs.ota_download_progress), fv(&vs.ota_install_progress), sv(&vs.ota_install_ready),
-                sv(&vs.door_front_left_closed), sv(&vs.door_front_right_closed), sv(&vs.door_rear_left_closed), sv(&vs.door_rear_right_closed),
-                sv(&vs.door_front_left_locked), sv(&vs.door_front_right_locked), sv(&vs.door_rear_left_locked), sv(&vs.door_rear_right_locked),
-                sv(&vs.closure_frunk_closed), sv(&vs.closure_frunk_locked), sv(&vs.closure_liftgate_closed), sv(&vs.closure_liftgate_locked),
-                sv(&vs.closure_tailgate_closed), sv(&vs.closure_tailgate_locked), sv(&vs.closure_side_bin_left_closed), sv(&vs.closure_side_bin_right_closed),
-                sv(&vs.window_front_left_closed), sv(&vs.window_front_right_closed), sv(&vs.window_rear_left_closed), sv(&vs.window_rear_right_closed),
-                sv(&vs.tire_pressure_status_front_left), sv(&vs.tire_pressure_status_front_right), sv(&vs.tire_pressure_status_rear_left), sv(&vs.tire_pressure_status_rear_right),
-                sv(&vs.pet_mode_status), sv(&vs.pet_mode_temperature_status), sv(&vs.gear_guard_locked), sv(&vs.gear_guard_video_status), sv(&vs.gear_guard_video_mode),
-                sv(&vs.alarm_sound_status), sv(&vs.wiper_fluid_state),
-                fv(&vs.limited_accel_cold), fv(&vs.limited_regen_cold), sv(&vs.twelve_volt_battery_health),
-                sv(&vs.service_mode), sv(&vs.trailer_status), sv(&vs.car_wash_mode),
-            ],
-        )?;
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(params))?;
 
         Ok(self.conn.last_insert_rowid())
     }
@@ -952,6 +1109,59 @@ mod tests {
         assert!((row.1 - 72.0).abs() < 0.01);
         assert!((row.2 - 10192690.0).abs() < 0.01);
         assert!((row.3.unwrap() - 65.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn insert_persists_diagnostic_and_ota_build_fields() {
+        // Every field the vehicle-state query requests should land in the
+        // snapshot table; these were previously fetched and dropped.
+        let db = make_test_db();
+        let json = r#"{
+            "batteryNeedsLfpCalibration": { "value": true },
+            "chargingDisabledAll": { "value": false },
+            "otaCurrentVersionNumber": { "value": 1234 },
+            "otaAvailableVersionGitHash": { "value": "abc123def" },
+            "otaInstallType": { "value": "Convenience" },
+            "otaCurrentVersionYear": { "value": 2026 },
+            "closureTonneauClosed": { "value": "signal_not_available" },
+            "windowFrontLeftCalibrated": { "value": "calibrated" },
+            "tirePressureStatusValidRearRight": { "value": "valid" },
+            "btmLfdHardwareFailureStatus": { "value": "no_failure" },
+            "brakeFluidLow": { "value": false },
+            "batteryHvThermalEventPropagation": { "value": "off" }
+        }"#;
+        let vs: VehicleStateFields = serde_json::from_str(json).unwrap();
+        let id = db.insert_state("VIN-1", &vs).unwrap();
+
+        let row: (String, String, f64, String, String, f64, String, String, String, String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT battery_needs_lfp_calibration, charging_disabled_all,
+                        ota_current_version_number, ota_available_git_hash, ota_install_type,
+                        ota_current_year, tonneau_closed, window_fl_calibrated,
+                        tire_valid_rr, btm_lfd_failure, brake_fluid_low, battery_hv_thermal_propagation
+                 FROM vehicle_state WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                        r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "true");
+        assert_eq!(row.1, "false");
+        assert!((row.2 - 1234.0).abs() < 0.01);
+        assert_eq!(row.3, "abc123def");
+        assert_eq!(row.4, "Convenience");
+        assert!((row.5 - 2026.0).abs() < 0.01);
+        assert_eq!(row.6, "signal_not_available");
+        assert_eq!(row.7, "calibrated");
+        assert_eq!(row.8, "valid");
+        assert_eq!(row.9, "no_failure");
+        assert_eq!(row.10, "false");
+        assert_eq!(row.11, "off");
     }
 
     #[test]

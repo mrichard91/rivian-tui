@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use super::types::GraphQlResponse;
+use super::types::{GraphQlError, GraphQlResponse};
 
 fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -39,6 +39,32 @@ pub struct RequestLog {
     pub response_body: Option<String>,
     /// Request headers (only populated in debug mode)
     pub request_headers: Option<String>,
+    /// Per-field GraphQL errors that came back alongside usable `data`
+    /// (partial response). Not fatal; surfaced so unsupported fields are
+    /// visible in the activity log.
+    pub warnings: Vec<String>,
+}
+
+/// The saved session is no longer accepted by the API (HTTP 401 or a
+/// GraphQL `UNAUTHENTICATED` error). Callers downcast to this to distinguish
+/// "log in again" from a transient failure.
+#[derive(Debug)]
+pub struct SessionExpired(pub String);
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session expired: {}", self.0)
+    }
+}
+
+impl std::error::Error for SessionExpired {}
+
+/// A successfully parsed GraphQL body: the deserialized `data` plus any
+/// non-fatal per-field errors the server reported alongside it.
+#[derive(Debug)]
+pub struct ParsedResponse<T> {
+    pub data: T,
+    pub warnings: Vec<String>,
 }
 
 /// HTTP client for Rivian's GraphQL API
@@ -149,7 +175,7 @@ impl RivianClient {
             key.to_ascii_lowercase().as_str(),
             "authorization"
                 | "csrf-token"
-                | "csrtftoken"
+                | "csrftoken"
                 | "csrf"
                 | "access_token"
                 | "accesstoken"
@@ -270,7 +296,12 @@ impl RivianClient {
             } else {
                 None
             },
+            warnings: Vec::new(),
         });
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(SessionExpired(format!("HTTP {status}")).into());
+        }
 
         if !status.is_success() {
             // Redact the response body before surfacing it as an error — it
@@ -283,19 +314,65 @@ impl RivianClient {
             bail!("HTTP {status}: {body}");
         }
 
-        let gql_resp: GraphQlResponse<Value> = serde_json::from_str(&text)
+        let parsed = Self::parse_graphql_body::<T>(&text)?;
+        if !parsed.warnings.is_empty() {
+            self.emit_log(RequestLog {
+                operation: operation_name.to_string(),
+                status: Some(status.as_u16()),
+                duration_ms,
+                error: None,
+                request_body: None,
+                response_body: None,
+                request_headers: None,
+                warnings: parsed.warnings,
+            });
+        }
+        Ok(parsed.data)
+    }
+
+    /// Parse a GraphQL response body.
+    ///
+    /// GraphQL servers return `{ data: {...partial...}, errors: [...] }` when
+    /// a single field's resolver fails — Rivian does this for fields a given
+    /// model lacks (third-row seats on an R1T, hitch status, ...). A response
+    /// is only a failure when `data` is absent/null; otherwise the errors are
+    /// returned as non-fatal warnings alongside the deserialized data.
+    pub fn parse_graphql_body<T: DeserializeOwned>(text: &str) -> Result<ParsedResponse<T>> {
+        let gql_resp: GraphQlResponse<Value> = serde_json::from_str(text)
             .with_context(|| format!("failed to parse response: {text}"))?;
 
-        if let Some(errors) = gql_resp.errors {
-            let msgs: Vec<_> = errors.iter().map(|e| e.display_message()).collect();
-            bail!("GraphQL errors: {}", msgs.join("; "));
-        }
+        let messages: Vec<String> = gql_resp
+            .errors
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|e| e.display_message())
+            .collect();
 
-        let data = gql_resp
-            .data
-            .context("GraphQL response contained no data")?;
+        let data = match gql_resp.data {
+            Some(data) if !data.is_null() => data,
+            _ => {
+                if messages.is_empty() {
+                    bail!("GraphQL response contained no data");
+                }
+                let unauthenticated = gql_resp
+                    .errors
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(GraphQlError::is_unauthenticated);
+                if unauthenticated {
+                    return Err(SessionExpired(messages.join("; ")).into());
+                }
+                bail!("GraphQL errors: {}", messages.join("; "));
+            }
+        };
 
-        serde_json::from_value(data).context("failed to parse GraphQL data payload")
+        let data = serde_json::from_value(data).context("failed to parse GraphQL data payload")?;
+        Ok(ParsedResponse {
+            data,
+            warnings: messages,
+        })
     }
 }
 
@@ -315,19 +392,55 @@ mod tests {
                 "login": {
                     "accessToken": "access-abcdef123456",
                     "refreshToken": "refresh-abcdef123456"
-                }
+                },
+                "createCsrfToken": { "csrfToken": "csrf-abcdef123456" }
             }
         });
 
         RivianClient::redact_json_value(&mut value);
 
         assert_ne!(value["variables"]["email"], "driver@example.com");
+        assert_ne!(
+            value["data"]["createCsrfToken"]["csrfToken"], "csrf-abcdef123456",
+            "csrfToken from the CSRF response must be redacted"
+        );
         assert_ne!(value["variables"]["password"], "supersecret");
         assert_ne!(value["variables"]["otpCode"], "123456");
         assert_ne!(value["data"]["login"]["accessToken"], "access-abcdef123456");
         assert_ne!(
             value["data"]["login"]["refreshToken"],
             "refresh-abcdef123456"
+        );
+    }
+
+    #[test]
+    fn partial_response_with_field_errors_still_yields_data() {
+        // Rivian returns per-field resolver errors (e.g. a field a given model
+        // lacks) alongside the rest of `data`. That must not discard the poll.
+        let body = r#"{
+            "data": { "vehicleState": { "batteryLevel": { "value": 55 }, "rearHitchStatus": null } },
+            "errors": [ { "message": "Cannot resolve rearHitchStatus", "path": ["vehicleState","rearHitchStatus"] } ]
+        }"#;
+        let parsed = RivianClient::parse_graphql_body::<serde_json::Value>(body).unwrap();
+        assert_eq!(parsed.data["vehicleState"]["batteryLevel"]["value"], 55);
+        assert_eq!(parsed.warnings.len(), 1);
+        assert!(parsed.warnings[0].contains("rearHitchStatus"));
+    }
+
+    #[test]
+    fn response_with_errors_and_no_data_is_an_error() {
+        let body = r#"{ "data": null, "errors": [ { "message": "Not authorized", "extensions": { "code": "UNAUTHENTICATED" } } ] }"#;
+        let err = RivianClient::parse_graphql_body::<serde_json::Value>(body).unwrap_err();
+        assert!(err.to_string().contains("UNAUTHENTICATED"), "{err}");
+    }
+
+    #[test]
+    fn unauthenticated_error_code_is_typed_session_expiry() {
+        let body = r#"{ "data": null, "errors": [ { "message": "Not authorized", "extensions": { "code": "UNAUTHENTICATED" } } ] }"#;
+        let err = RivianClient::parse_graphql_body::<serde_json::Value>(body).unwrap_err();
+        assert!(
+            err.downcast_ref::<SessionExpired>().is_some(),
+            "UNAUTHENTICATED must surface as SessionExpired, got {err}"
         );
     }
 }

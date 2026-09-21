@@ -1,8 +1,9 @@
-# GraphQL Field Opportunities (proposal)
+# GraphQL Field Opportunities
 
-Research pass surveying what open-source Rivian clients fetch that **rivian-tui does
-not yet**, so we can decide what to add in a future pass. Nothing here is wired in —
-this is a menu, not a changelog.
+Survey of what open-source Rivian clients fetch versus what **rivian-tui** requests
+today. Sections are marked **wired in** (already in `src/api/queries.rs`) or
+**not yet** (still a menu item). Re-verified 2026-09-15 against the python
+client's `const.py` / `rivian.py` on `main`.
 
 **Sources mined (canonical reverse-engineered clients):**
 - [`bretterer/rivian-python-client`](https://github.com/bretterer/rivian-python-client) — `src/rivian/rivian.py`, `src/rivian/const.py`. The authoritative community client; the Home Assistant integration inherits its exact field set.
@@ -36,9 +37,10 @@ a template for discovering one.
 
 ---
 
-## B. OTA / software-update fields (high value)
+## B. OTA / software-update fields — **wired in**
 
-Already in the `GetVehicleState` query we call — just add to the selection:
+All four fields below and the `getOTAUpdateDetails` query are requested, rendered
+(TUI System panel, web Software card) and persisted to `vehicle_state`.
 
 | Field | Why |
 |-------|-----|
@@ -62,48 +64,46 @@ work just shipped on the web dashboard.
 
 ---
 
-## C. Other high-value vehicleState / charging fields
+## C. Other vehicleState / charging fields
 
-All from the same queries we already issue (unless noted). Excludes fields we already
-fetch (e.g. `limitedAccelCold`, `limitedRegenCold`, `carWashMode`, `trailerStatus`,
-`wiperFluidState`, `cabinPreconditioningType`, `gearGuardVideoMode/Status`,
-`batteryHvThermalEvent`, and the full live-session set — all already in our queries).
+### Wired in
 
-**Tire pressure — actual numeric PSI** (we only fetch the `tirePressureStatus*` enums):
-- `tirePressureFrontLeft`, `tirePressureFrontRight`, `tirePressureRearLeft`, `tirePressureRearRight` *(subscription-only — see caveat)*
-- `tirePressureStatusValidFrontLeft` / `…FrontRight` / `…RearLeft` / `…RearRight` (validity flags, main query)
+`tirePressureStatusValid*` (×4), `chargingDisabledAll`, `batteryNeedsLfpCalibration`,
+`batteryHvThermalEventPropagation`, `brakeFluidLow`, the six `btm*HardwareFailureStatus`
+fields, `windowsNextAction`'s siblings `window*Calibrated` (×4), and
+`closureTonneauClosed`. All feed `AlertsView` and are persisted.
 
-**Charging / trip-charging:**
-- `chargingTripTargetSoc` — target SoC for trip charging *(subscription-only)*
-- `chargingTripTargetMinsRemaining` — minutes to reach the trip target *(subscription-only)*
-- `chargingTimeEstimationValidity` — whether the time-remaining estimate is trustworthy *(subscription-only)*
-- `chargingDisabledAll` — global charging-disabled flag (main query)
-- `chargingDisabledACFaultState` — AC charging fault *(subscription-only)*
-- `closureChargePortDoorNextAction` — pending charge-port-door action *(subscription-only)*
+### Not yet — polled `GetVehicleState` fields (cheap to add)
 
-**Range / battery health:**
-- `rangeThreshold` — low-range threshold
-- `batteryNeedsLfpCalibration` — LFP pack needs a 100% calibration charge (very useful for LFP owners)
-- `batteryCellType` — LFP vs NMC chemistry
-- `coldRangeNotification` — cold-weather range warning *(subscription-only)*
-- `batteryHvThermalEventPropagation` — HV thermal-event propagation flag
+- `closureTonneauLocked`, `closureSideBinLeftLocked`, `closureSideBinRightLocked` — the
+  Access panel has no tonneau / side-bin lock state today.
+- `closure{Frunk,Liftgate,Tailgate,Tonneau,SideBinLeft,SideBinRight}NextAction`,
+  `windowsNextAction` — what the next button press will do.
+- `rangeThreshold` — low-range alert threshold.
+- `batteryCellType` — LFP vs NMC; contextualises the calibration alert.
+- `rearHitchStatus`, `seatThirdRowLeftHeat`, `seatThirdRowRightHeat` — model-dependent
+  (R1S / hitch-equipped). Partial-response handling in `client.rs` means an unsupported
+  field logs a warning instead of failing the poll.
+- `activeDriverName`, `geoLocation`, `gnssError`, `gearGuardVideoTermsAccepted`.
 
-**Safety / fluids:**
-- `brakeFluidLow`
-- `rearHitchStatus`
+### Not yet — subscription-only (websocket)
 
-**Driver identity / Gear Guard cam:**
-- `activeDriverName` — which driver profile/key is active *(also in subscription set)*
-- `gearGuardVideoTermsAccepted`
+- Numeric tire PSI: `tirePressureFrontLeft` / `FrontRight` / `RearLeft` / `RearRight`.
+- `chargingTripTargetSoc`, `chargingTripTargetMinsRemaining`, `chargingTimeEstimationValidity`.
+- `chargingDisabledACFaultState`, `closureChargePortDoorNextAction`, `coldRangeNotification`.
 
-**Geo:**
-- `geoLocation` — geofence / named-location resolution
-- `gnssError` — GNSS error/accuracy (complements raw `gnssLocation`)
+### Not yet — additional queries
 
-**New query — home charger telemetry:** `getRegisteredWallboxes` (charging endpoint,
-no variables): `wallboxId userId wifiId name linked latitude longitude chargingStatus
-power currentVoltage currentAmps softwareVersion model serialNumber maxAmps maxVoltage
-maxPower`.
+- **`getVehicleChargingSchedules`** (gateway, `$vehicleId`):
+  `getVehicle(id: $vehicleId) { chargingSchedules { weekDays startTime duration location amperage enabled } }`.
+  A read query for charge schedules *does* exist (earlier revisions of this doc said
+  otherwise). Natural "next scheduled charge" row on the Charging card.
+- **`getRegisteredWallboxes`** (charging endpoint, no variables): `wallboxId userId
+  wifiId name linked latitude longitude chargingStatus power currentVoltage currentAmps
+  softwareVersion model serialNumber maxAmps maxVoltage maxPower`.
+- **`getVehicleImages`** (gateway): rendered vehicle image URLs for the web dashboard.
+- `DriversAndKeys`, `getUserInfo { enrolledPhones registrationChannels }` — account PII;
+  deliberately not planned.
 
 ---
 
@@ -114,16 +114,18 @@ returned only over the `VehicleState` **websocket subscription**
 (`wss://api.rivian.com/gql-consumer-subscriptions/graphql`), not the polled
 `GetVehicleState` query — over plain polling they may come back `null`. We currently
 poll, so adding these only pays off if/when we add the websocket path (or accept that
-they may be empty). No charging-**schedule** read query exists in any client
-(schedules are set via commands, not queried), so `chargingTripTargetSoc` above is the
-only trip-charging data readable today.
+they may be empty).
 
 ---
 
 ## Suggested priority
 
-1. `getOTAUpdateDetails` (release-notes URL) + `ota*VersionNumber` / `*GitHash` — pairs with the OTA work just done.
-2. Numeric tire PSI (`tirePressureFrontLeft`…) — concrete data behind the status enums.
-3. `chargingTripTargetSoc` / `chargingTripTargetMinsRemaining`.
-4. `batteryNeedsLfpCalibration`, `rangeThreshold`, `batteryCellType`, `brakeFluidLow`.
-5. `getRegisteredWallboxes` — if home-charger telemetry is wanted.
+1. Polled fields above (locks, next-actions, `rangeThreshold`, `batteryCellType`) — query
+   string + struct fields + a `VEHICLE_STATE_DATA_COLUMNS` row each.
+2. `getVehicleChargingSchedules` + a low-range alert from `rangeThreshold`.
+3. `getRegisteredWallboxes` — if a Rivian wallbox is registered.
+4. Websocket subscription — unlocks numeric tire PSI and the trip-charging fields, and
+   replaces interval polling with push.
+
+Validate per-model availability with `cargo run -- --stdout --query '...'` before wiring a
+field into the UI; `--stdout` injects `$vehicleID` (gateway) or `$vehicleId` (charging).
