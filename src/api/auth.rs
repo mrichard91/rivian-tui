@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -9,7 +10,7 @@ use super::queries;
 use super::types::*;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const CONFIG_DIR_NAME: &str = "rivian-tui";
 const TOKEN_FILE_NAME: &str = "tokens.json";
@@ -170,10 +171,23 @@ impl AuthManager {
     fn save_legacy_tokens(tokens: &AuthTokens) -> Result<()> {
         let path = Self::legacy_token_file_path()?;
         let json_str = serde_json::to_string_pretty(tokens)?;
-        fs::write(&path, json_str).context("failed to write legacy token file")?;
+
+        // Create the file owner-only rather than writing then chmod-ing, so
+        // the tokens are never readable by other users, even briefly.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
         #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .context("failed to open legacy token file")?;
+        // `mode` only applies on creation; tighten a pre-existing file before
+        // any token bytes land in it.
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))
             .context("failed to set legacy token file permissions")?;
+        file.write_all(json_str.as_bytes())
+            .context("failed to write legacy token file")?;
         Ok(())
     }
 
@@ -597,6 +611,32 @@ mod tests {
 
         let meta = fs::metadata(&path).unwrap();
         assert!(meta.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_token_file_is_owner_only_even_when_it_already_existed() {
+        let _ctx = AuthTestContext::new();
+        let tokens = AuthTokens {
+            access_token: "test-at".into(),
+            refresh_token: "test-rt".into(),
+            user_session_token: "test-ust".into(),
+            csrf_token: "test-csrf".into(),
+            app_session_token: "test-ast".into(),
+            vehicle_id: "test-vid".into(),
+            device_id: Some("test-device".into()),
+        };
+        let path = AuthManager::legacy_token_file_path().unwrap();
+
+        AuthManager::save_legacy_tokens(&tokens).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "fresh file");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        AuthManager::save_legacy_tokens(&tokens).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "pre-existing world-readable file");
+        assert!(AuthManager::load_legacy_tokens().unwrap().is_some());
     }
 
     #[test]

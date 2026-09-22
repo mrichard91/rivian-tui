@@ -292,9 +292,10 @@ impl AlertsView {
         ] {
             // Compare case-insensitively: the wire reports e.g. "Off" and
             // "Disabled" for pet mode, and a case-sensitive list silently
-            // treats "Off" as active — the alert then never clears.
+            // treats "Off" as active — the alert then never clears. Car wash
+            // mode says "disable" (no d).
             let value = vs.get_str(field).to_ascii_lowercase();
-            if !matches!(value.as_str(), "unknown" | "off" | "disabled") {
+            if !matches!(value.as_str(), "unknown" | "off" | "disable" | "disabled") {
                 push(AlertKind::Mode, AlertSeverity::Warning, label.into());
             }
         }
@@ -913,7 +914,9 @@ impl SoftwareView {
         };
 
         let is_installing = installing.is_some() || downloading.is_some();
-        let is_install_staged = install_ready != "—";
+        // Idle snapshots report "ota_not_available", which is a real value
+        // but not a staged install.
+        let is_install_staged = install_ready != "—" && !install_ready.contains("not ");
 
         Self {
             current_version: current,
@@ -1579,5 +1582,34 @@ mod tests {
         assert_eq!(alerts.items.len(), 1, "{:?}", alerts.items);
         assert_eq!(alerts.items[0].message, "Door or hatch open");
         assert_eq!(VehicleView::from_state(&vs).all_closed, "open");
+    }
+
+    #[test]
+    fn car_wash_mode_disable_token_is_not_an_alert() {
+        // Observed carWashMode tokens: "off" and "disable" (1,963 rows) —
+        // no trailing d, unlike pet mode's "Disabled".
+        let vs = VehicleStateFields {
+            car_wash_mode: state_value(json!("disable")),
+            ..Default::default()
+        };
+        let alerts = AlertsView::from_state(&vs);
+        assert!(alerts.items.is_empty(), "{:?}", alerts.items);
+    }
+
+    #[test]
+    fn ota_not_available_is_not_a_staged_install() {
+        // Observed otaInstallReady tokens: "ota_not_available" (every
+        // idle snapshot) and "ota_available".
+        let idle = VehicleStateFields {
+            ota_install_ready: state_value(json!("ota_not_available")),
+            ..Default::default()
+        };
+        assert!(!SoftwareView::from_state(&idle).is_install_staged);
+
+        let staged = VehicleStateFields {
+            ota_install_ready: state_value(json!("ota_available")),
+            ..Default::default()
+        };
+        assert!(SoftwareView::from_state(&staged).is_install_staged);
     }
 }

@@ -105,8 +105,11 @@ impl WebConfig {
     }
 }
 
+/// Loopback by default: the dashboard is unauthenticated and serves live
+/// location, VIN, and lock state. Set `bind = "0.0.0.0"` to opt in to LAN
+/// access.
 fn default_web_bind() -> String {
-    "0.0.0.0".into()
+    "127.0.0.1".into()
 }
 
 fn default_web_port() -> u16 {
@@ -298,6 +301,15 @@ mod tests {
             port: 0,
         };
         assert!(disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn web_dashboard_defaults_to_loopback_only() {
+        // The page serves live GPS, VIN and lock state with no auth; being
+        // reachable from the LAN must be an explicit choice.
+        let config: AppConfig = toml::from_str("[web]\nenabled = true\n").unwrap();
+        let addr = config.enabled_web().unwrap().socket_addr().unwrap();
+        assert!(addr.ip().is_loopback(), "default bind was {addr}");
     }
 
     #[test]

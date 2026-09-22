@@ -65,7 +65,7 @@ fn status_color(value: &str) -> Color {
         || value.contains("signal")
         || value.contains("not_")
         || value.contains("inactive")
-        || value.contains("disabled")
+        || value.contains("disable")
         || value.contains("off")
         || value.contains("idle")
         || value == "false"
@@ -129,7 +129,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App) {
         Constraint::Min(8),    // body
     ];
     if app.show_log {
-        constraints.push(Constraint::Length(if app.debug { 16 } else { 10 }));
+        constraints.push(Constraint::Length(app.log_panel_height()));
     }
     constraints.push(Constraint::Length(1)); // footer
 
@@ -517,13 +517,17 @@ fn draw_col_status(
     const RW: usize = 8;
 
     // --- Access ---
+    // A closure the model doesn't have reports `signal_not_available`.
+    fn reported(field: &Option<crate::api::types::StateValue>) -> Option<&str> {
+        field
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .filter(|s| *s != "signal_not_available")
+    }
     let access_icon = |closed: &Option<crate::api::types::StateValue>,
                        locked: &Option<crate::api::types::StateValue>|
      -> (String, Color) {
-        match (
-            closed.as_ref().and_then(|v| v.as_str()),
-            locked.as_ref().and_then(|v| v.as_str()),
-        ) {
+        match (reported(closed), locked.as_ref().and_then(|v| v.as_str())) {
             (Some("open"), _) => ("OPEN".into(), Color::Red),
             (Some("closed"), Some("locked")) => ("Shut+Lk".into(), Color::Green),
             (Some("closed"), Some("unlocked")) => ("Shut+Un".into(), Color::Yellow),
@@ -549,7 +553,13 @@ fn draw_col_status(
     let rl = access_icon(&vs.door_rear_left_closed, &vs.door_rear_left_locked);
     let rr = access_icon(&vs.door_rear_right_closed, &vs.door_rear_right_locked);
     let frunk = access_icon(&vs.closure_frunk_closed, &vs.closure_frunk_locked);
-    let trunk = access_icon(&vs.closure_liftgate_closed, &vs.closure_liftgate_locked);
+    // The R1T's rear closure is its tailgate (liftgate always reports
+    // `signal_not_available`); prefer the liftgate only where it exists.
+    let trunk = if reported(&vs.closure_liftgate_closed).is_some() {
+        access_icon(&vs.closure_liftgate_closed, &vs.closure_liftgate_locked)
+    } else {
+        access_icon(&vs.closure_tailgate_closed, &vs.closure_tailgate_locked)
+    };
 
     let tire_icon = |field: &Option<crate::api::types::StateValue>| -> (String, Color) {
         match field.as_ref().and_then(|v| v.as_str()) {
@@ -1186,7 +1196,17 @@ fn draw_activity_log(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let visible_height = inner.height as usize;
-    let start = app.log_scroll;
+    if visible_height == 0 {
+        return;
+    }
+    // On a short terminal the layout squeezes this panel below its nominal
+    // height; slide the window so the selected entry (the newest one while
+    // tailing) is always on screen.
+    let selected = app.log_selected.min(app.activity_log.len() - 1);
+    let mut start = app.log_scroll.min(selected);
+    if selected >= start + visible_height {
+        start = selected + 1 - visible_height;
+    }
     let end = (start + visible_height).min(app.activity_log.len());
 
     let lines: Vec<Line> = app.activity_log[start..end]
@@ -1336,7 +1356,17 @@ fn draw_login(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         )
     };
-    frame.render_widget(Paragraph::new(Line::from(msg)), rows[8]);
+    draw_status_message(frame, rows[8].union(rows[9]), msg);
+}
+
+/// Status / error line on the auth screens. Errors carry their full cause
+/// chain, so let them wrap into the space below instead of truncating at
+/// the popup edge.
+fn draw_status_message(frame: &mut Frame, area: Rect, msg: Span) {
+    frame.render_widget(
+        Paragraph::new(Line::from(msg)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,7 +1418,7 @@ fn draw_mfa(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         )
     };
-    frame.render_widget(Paragraph::new(Line::from(msg)), rows[5]);
+    draw_status_message(frame, rows[5].union(rows[6]), msg);
 }
 
 fn draw_vehicle_select(frame: &mut Frame, app: &App) {
@@ -1459,7 +1489,7 @@ fn draw_vehicle_select(frame: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         )
     };
-    frame.render_widget(Paragraph::new(Line::from(msg)), rows[3]);
+    draw_status_message(frame, rows[3].union(rows[4]), msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,6 +1548,95 @@ mod tests {
         assert_eq!(status_color("ota_not_available"), Color::DarkGray);
         assert_eq!(status_color("Install_Success"), Color::Green);
         assert_eq!(status_color("ready"), Color::Green);
+    }
+
+    fn screen_text(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn activity_log_shows_the_newest_entry() {
+        for debug in [false, true] {
+            // 40 rows fits the full panel; 20 forces the layout to squeeze it.
+            for height in [40, 20] {
+                let mut app = App::new(debug, None);
+                app.show_log = true;
+                for idx in 0..30 {
+                    app.log(LogLevel::Info, &format!("entry-{idx:02}"));
+                }
+                let text = screen_text(&app, 100, height);
+                assert!(
+                    text.contains("entry-29"),
+                    "newest log line hidden (debug={debug}, height={height})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_login_error_wraps_instead_of_being_cut_off() {
+        let mut app = App::new(false, None);
+        app.mode = Mode::Login;
+        app.login_error = Some(
+            "Login failed: login request failed: GraphQL errors: \
+             The email or password you entered is incorrect ENDMARK"
+                .into(),
+        );
+        let mut terminal = Terminal::new(backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("ENDMARK"), "tail of the error was cut off");
+    }
+
+    #[test]
+    fn r1t_access_panel_shows_the_tailgate_not_the_missing_liftgate() {
+        // On an R1T the liftgate is always `signal_not_available`; the
+        // tailgate carries the real state.
+        let app = App::new(false, None);
+        let vs: crate::api::types::VehicleStateFields = serde_json::from_str(
+            r#"{
+                "closureFrunkClosed": { "value": "closed" },
+                "closureFrunkLocked": { "value": "locked" },
+                "closureLiftgateClosed": { "value": "signal_not_available" },
+                "closureLiftgateLocked": { "value": "locked" },
+                "closureTailgateClosed": { "value": "open" },
+                "closureTailgateLocked": { "value": "locked" }
+            }"#,
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(backend::TestBackend::new(40, 25)).unwrap();
+        terminal
+            .draw(|frame| draw_col_status(frame, frame.area(), &app, &vs))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("signal_not_available"), "{text}");
+        assert!(text.contains("OPEN"), "open tailgate not shown");
+    }
+
+    #[test]
+    fn disable_token_is_idle_coloured() {
+        // carWashMode reports "disable", not "disabled".
+        assert_eq!(status_color("disable"), Color::DarkGray);
     }
 
     #[test]

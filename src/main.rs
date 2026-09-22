@@ -9,11 +9,11 @@ mod view_model;
 mod web;
 
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -191,10 +191,7 @@ async fn run_tui(
         // interval: live-charging data updates every 60s, and a page that
         // reloads every 5 minutes would render that cadence invisible.
         let refresh_interval = cli.poll_interval.min(60);
-        app.log(
-            LogLevel::Info,
-            &format!("Web dashboard listening on http://{addr}/"),
-        );
+        app.log(LogLevel::Info, &web_listen_message(addr));
         tokio::spawn(async move {
             if let Err(e) = web::serve(listener, shared, refresh_interval).await {
                 eprintln!("web server error: {e}");
@@ -212,7 +209,6 @@ async fn run_tui(
         app.start_session();
     }
 
-    let mut last_poll = Instant::now();
     let tick_rate = Duration::from_millis(200);
 
     loop {
@@ -223,14 +219,10 @@ async fn run_tui(
         app.drain_events();
 
         // Auto-poll on interval when authenticated and on dashboard. A poll
-        // already in flight is skipped, so the timer only restarts when a
-        // request actually went out.
-        if app.mode == Mode::Dashboard
-            && app.tokens.is_some()
-            && last_poll.elapsed().as_secs() >= app.poll_interval_secs
-            && app.poll_vehicle_state()
-        {
-            last_poll = Instant::now();
+        // already in flight is skipped; `App` restarts the timer whenever a
+        // request actually goes out, including the post-login bundle.
+        if app.mode == Mode::Dashboard && app.poll_due() {
+            app.poll_vehicle_state();
         }
 
         // While the vehicle is actively charging, poll the live-session
@@ -259,102 +251,7 @@ async fn run_tui(
                     continue;
                 }
 
-                match app.mode {
-                    Mode::Dashboard => {
-                        if app.show_debug_detail {
-                            match key.code {
-                                KeyCode::Char('d') | KeyCode::Esc => {
-                                    app.show_debug_detail = false;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            match key.code {
-                                KeyCode::Char('q') => {
-                                    app.should_quit = true;
-                                }
-                                KeyCode::Char('r') => {
-                                    if app.poll_vehicle_state() {
-                                        last_poll = Instant::now();
-                                    } else if app.tokens.is_some() {
-                                        app.log(LogLevel::Info, "Refresh already in progress");
-                                    }
-                                }
-                                KeyCode::Char('L') => {
-                                    app.logout();
-                                }
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    app.scroll_log_down();
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    app.scroll_log_up();
-                                }
-                                KeyCode::Char('l') => {
-                                    app.show_log = !app.show_log;
-                                }
-                                KeyCode::Char('d') if app.debug => {
-                                    if let Some(entry) = app.activity_log.get(app.log_selected) {
-                                        if entry.detail.is_some() {
-                                            app.show_debug_detail = true;
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Mode::Login => match key.code {
-                        KeyCode::Esc => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Tab | KeyCode::BackTab => {
-                            app.next_login_field();
-                        }
-                        KeyCode::Enter => {
-                            app.start_login();
-                        }
-                        KeyCode::Backspace => {
-                            app.active_login_input().pop();
-                        }
-                        KeyCode::Char(c) => {
-                            app.active_login_input().push(c);
-                        }
-                        _ => {}
-                    },
-                    Mode::MfaPrompt => {
-                        app.login_field = app::LoginField::Otp;
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.cancel_auth_flow();
-                            }
-                            KeyCode::Enter => {
-                                app.submit_otp();
-                            }
-                            KeyCode::Backspace => {
-                                app.login_otp.pop();
-                            }
-                            KeyCode::Char(c) => {
-                                app.login_otp.push(c);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Mode::VehicleSelect => match key.code {
-                        KeyCode::Esc => {
-                            app.cancel_auth_flow();
-                        }
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            app.select_vehicle_down();
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            app.select_vehicle_up();
-                        }
-                        KeyCode::Enter => {
-                            app.confirm_vehicle_selection();
-                        }
-                        _ => {}
-                    },
-                }
+                handle_key(&mut app, key);
 
                 if app.should_quit {
                     break;
@@ -366,9 +263,206 @@ async fn run_tui(
     Ok(())
 }
 
+/// Activity-log line announcing the web dashboard. The page has no auth and
+/// shows live location, so say so when it's reachable beyond this machine.
+fn web_listen_message(addr: std::net::SocketAddr) -> String {
+    if addr.ip().is_loopback() {
+        format!("Web dashboard listening on http://{addr}/")
+    } else {
+        format!(
+            "Web dashboard listening on http://{addr}/ — reachable from the network \
+             with no authentication (location, VIN, lock state)"
+        )
+    }
+}
+
+/// Apply one key press to the app for whichever screen is active.
+fn handle_key(app: &mut App, key: KeyEvent) {
+    // Raw mode delivers Ctrl+C as a key event instead of SIGINT, so honour
+    // it here on every screen.
+    let chord = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
+        return;
+    }
+
+    match app.mode {
+        Mode::Dashboard => {
+            if app.show_debug_detail {
+                match key.code {
+                    KeyCode::Char('d') | KeyCode::Esc => {
+                        app.show_debug_detail = false;
+                    }
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => {
+                        app.should_quit = true;
+                    }
+                    KeyCode::Char('r') => {
+                        if !app.poll_vehicle_state() && app.tokens.is_some() {
+                            app.log(LogLevel::Info, "Refresh already in progress");
+                        }
+                    }
+                    KeyCode::Char('L') => {
+                        app.logout();
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.scroll_log_down();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.scroll_log_up();
+                    }
+                    KeyCode::Char('l') => {
+                        app.show_log = !app.show_log;
+                    }
+                    KeyCode::Char('d') if app.debug => {
+                        if let Some(entry) = app.activity_log.get(app.log_selected) {
+                            if entry.detail.is_some() {
+                                app.show_debug_detail = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Mode::Login => match key.code {
+            KeyCode::Esc => {
+                app.should_quit = true;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                app.next_login_field();
+            }
+            KeyCode::Enter => {
+                app.start_login();
+            }
+            KeyCode::Backspace => {
+                app.active_login_input().pop();
+            }
+            KeyCode::Char(c) if !chord => {
+                app.active_login_input().push(c);
+            }
+            _ => {}
+        },
+        Mode::MfaPrompt => match key.code {
+            KeyCode::Esc => {
+                app.cancel_auth_flow();
+            }
+            KeyCode::Enter => {
+                app.submit_otp();
+            }
+            KeyCode::Backspace => {
+                app.login_otp.pop();
+            }
+            KeyCode::Char(c) if !chord => {
+                app.login_otp.push(c);
+            }
+            _ => {}
+        },
+        Mode::VehicleSelect => match key.code {
+            KeyCode::Esc => {
+                app.cancel_auth_flow();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.select_vehicle_down();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.select_vehicle_up();
+            }
+            KeyCode::Enter => {
+                app.confirm_vehicle_selection();
+            }
+            _ => {}
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn web_listen_message_warns_when_reachable_from_the_network() {
+        let lan: std::net::SocketAddr = "0.0.0.0:8787".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        assert!(web_listen_message(lan).contains("no authentication"));
+        assert!(!web_listen_message(local).contains("no authentication"));
+    }
+
+    #[test]
+    fn login_form_is_usable_after_backing_out_of_mfa() {
+        let mut app = App::new(false, None);
+        app.mode = Mode::MfaPrompt;
+        type_str(&mut app, "12");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Login);
+
+        type_str(&mut app, "me@example.com");
+        press(&mut app, KeyCode::Tab);
+        type_str(&mut app, "pw");
+
+        assert_eq!(app.login_email, "me@example.com");
+        assert_eq!(app.login_password, "pw");
+    }
+
+    #[test]
+    fn logout_returns_focus_to_the_email_field() {
+        let _auth = api::auth::AuthTestContext::new();
+        let mut app = App::new(false, None);
+        app.mode = Mode::Login;
+        press(&mut app, KeyCode::Tab); // focus Password, as when submitting
+        app.mode = Mode::Dashboard;
+
+        press(&mut app, KeyCode::Char('L'));
+        type_str(&mut app, "me@example.com");
+
+        assert_eq!(app.login_email, "me@example.com");
+        assert!(app.login_password.is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_any_screen_without_typing_a_c() {
+        for mode in [
+            Mode::Dashboard,
+            Mode::Login,
+            Mode::MfaPrompt,
+            Mode::VehicleSelect,
+        ] {
+            let mut app = App::new(false, None);
+            app.mode = mode.clone();
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            );
+            assert!(app.should_quit, "Ctrl+C must quit from {mode:?}");
+            assert!(app.login_email.is_empty() && app.login_otp.is_empty());
+        }
+    }
+
+    #[test]
+    fn control_chords_are_not_typed_into_login_fields() {
+        let mut app = App::new(false, None);
+        app.mode = Mode::Login;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(app.login_email.is_empty());
+    }
 
     #[test]
     fn stdout_injects_whichever_vehicle_variable_the_query_declares() {

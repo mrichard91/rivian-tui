@@ -797,7 +797,12 @@ impl VehicleStateFields {
         self.get_f64(&self.battery_capacity)
     }
 
+    /// Remaining charge time, only while a session is active — the API keeps
+    /// reporting a stale `timeToEndOfCharge` after the car is unplugged.
     pub fn time_to_full(&self) -> Option<String> {
+        if !self.is_actively_charging() {
+            return None;
+        }
         self.get_f64(&self.time_to_end_of_charge).map(|v| {
             let mins = v as u64;
             let h = mins / 60;
@@ -1061,7 +1066,9 @@ mod tests {
         assert_eq!(vs.charger_status_str(), "chrgr_sts_not_connected");
         assert!((vs.battery_limit_percent().unwrap() - 80.0).abs() < 0.01);
         assert!((vs.battery_capacity_kwh().unwrap() - 135.0).abs() < 0.01);
-        assert_eq!(vs.time_to_full().unwrap(), "1h 30m");
+        // Unplugged: the stale timeToEndOfCharge is not surfaced (see
+        // time_to_full_is_only_reported_while_charging for the live case).
+        assert_eq!(vs.time_to_full(), None);
         assert_eq!(vs.last_sync().unwrap(), "2026-03-19T06:00:00Z");
         assert_eq!(vs.location_summary().as_deref(), Some("37.775, -122.419"));
 
@@ -1252,6 +1259,25 @@ mod tests {
             !not_charging_status.is_actively_charging(),
             "chrgr_sts_not_charging must not be reported as actively charging"
         );
+    }
+
+    #[test]
+    fn time_to_full_is_only_reported_while_charging() {
+        // The wire keeps a stale timeToEndOfCharge after unplugging (up to
+        // 6365 min observed with chargerState = charging_ready).
+        let unplugged: VehicleStateFields = serde_json::from_str(
+            r#"{ "chargerState": { "value": "charging_ready" },
+                 "timeToEndOfCharge": { "value": 6365 } }"#,
+        )
+        .unwrap();
+        assert_eq!(unplugged.time_to_full(), None);
+
+        let charging: VehicleStateFields = serde_json::from_str(
+            r#"{ "chargerState": { "value": "charging_active" },
+                 "timeToEndOfCharge": { "value": 95 } }"#,
+        )
+        .unwrap();
+        assert_eq!(charging.time_to_full().as_deref(), Some("1h 35m"));
     }
 
     #[test]

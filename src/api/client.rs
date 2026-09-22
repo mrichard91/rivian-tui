@@ -17,6 +17,13 @@ fn build_http_client() -> Result<reqwest::Client> {
         .context("failed to build HTTP client")
 }
 
+/// First 256 chars of a non-JSON response body (e.g. a CDN error page), so
+/// errors quote enough to diagnose without dumping kilobytes of HTML into
+/// the activity log or login screen.
+fn body_snippet(text: &str) -> String {
+    text.chars().take(256).collect()
+}
+
 /// Base URLs for Rivian's GraphQL endpoints
 pub const GATEWAY_URL: &str = "https://rivian.com/api/gql/gateway/graphql";
 /// Vehicle state and other authenticated queries go through the same gateway
@@ -309,7 +316,7 @@ impl RivianClient {
             // sensitive request fields back to the caller.
             let body = match serde_json::from_str::<Value>(&text) {
                 Ok(_) => Self::redact_json_text(&text),
-                Err(_) => text.chars().take(256).collect::<String>(),
+                Err(_) => body_snippet(&text),
             };
             bail!("HTTP {status}: {body}");
         }
@@ -339,7 +346,7 @@ impl RivianClient {
     /// returned as non-fatal warnings alongside the deserialized data.
     pub fn parse_graphql_body<T: DeserializeOwned>(text: &str) -> Result<ParsedResponse<T>> {
         let gql_resp: GraphQlResponse<Value> = serde_json::from_str(text)
-            .with_context(|| format!("failed to parse response: {text}"))?;
+            .with_context(|| format!("failed to parse response: {}", body_snippet(text)))?;
 
         let messages: Vec<String> = gql_resp
             .errors
@@ -425,6 +432,17 @@ mod tests {
         assert_eq!(parsed.data["vehicleState"]["batteryLevel"]["value"], 55);
         assert_eq!(parsed.warnings.len(), 1);
         assert!(parsed.warnings[0].contains("rearHitchStatus"));
+    }
+
+    #[test]
+    fn unparseable_body_is_truncated_in_the_error() {
+        // A captive portal / CDN error page can be many KB of HTML; the
+        // error (which now reaches the login screen with its full chain)
+        // must not carry all of it.
+        let body = format!("<html>{}</html>", "x".repeat(10_000));
+        let err = RivianClient::parse_graphql_body::<serde_json::Value>(&body).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.len() < 600, "error was {} bytes", shown.len());
     }
 
     #[test]

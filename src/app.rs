@@ -50,12 +50,12 @@ pub enum Mode {
     VehicleSelect,
 }
 
-/// Input field currently focused during login
+/// Input field currently focused on the login form. The MFA screen has a
+/// single input and writes `login_otp` directly, so it is not a variant here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoginField {
     Email,
     Password,
-    Otp,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +102,13 @@ impl ErrorSource {
             Self::Metadata => "Vehicle metadata",
             Self::ChargingHistory => "Charging history",
         }
+    }
+
+    /// `"<label>: <error>"` with the full cause chain. Plain `{e}` on an
+    /// `anyhow::Error` prints only the outermost context ("login request
+    /// failed"), which hides the server's actual reason.
+    pub fn message(self, err: &anyhow::Error) -> String {
+        format!("{}: {err:#}", self.label())
     }
 }
 
@@ -224,6 +231,10 @@ pub struct App {
     /// A vehicle-state request is outstanding. Prevents `r` mashing or an
     /// overlapping interval tick from stacking identical polls.
     pub poll_in_flight: bool,
+    /// When the last vehicle-state request went out, from any caller (auto
+    /// timer, `r`, or the post-login session bundle), so the interval timer
+    /// never fires a duplicate right after a poll it didn't start.
+    last_poll: Option<Instant>,
 
     // Activity log
     pub activity_log: Vec<LogEntry>,
@@ -296,6 +307,7 @@ impl App {
             vehicle_state_error: None,
             poll_interval_secs: 300,
             poll_in_flight: false,
+            last_poll: None,
 
             activity_log: Vec::new(),
             log_scroll: 0,
@@ -377,6 +389,22 @@ impl App {
             .with_logger(log_tx)
     }
 
+    /// Outer height of the activity-log panel (including its border). The
+    /// layout and the scroll arithmetic below both derive from this, so the
+    /// number of rows we scroll by can't drift from the rows actually drawn.
+    pub fn log_panel_height(&self) -> u16 {
+        if self.debug {
+            16
+        } else {
+            10
+        }
+    }
+
+    /// Log lines visible inside the panel's border.
+    fn log_visible_rows(&self) -> usize {
+        usize::from(self.log_panel_height().saturating_sub(2)).max(1)
+    }
+
     fn focus_last_log(&mut self) {
         if self.activity_log.is_empty() {
             self.log_scroll = 0;
@@ -384,7 +412,7 @@ impl App {
             return;
         }
 
-        let visible = 10;
+        let visible = self.log_visible_rows();
         self.log_selected = self.activity_log.len() - 1;
         self.log_scroll = self.log_selected.saturating_sub(visible - 1);
     }
@@ -469,7 +497,7 @@ impl App {
                 self.recent_trend = points;
             }
             Err(e) => {
-                self.log(LogLevel::Error, &format!("Trend load failed: {e}"));
+                self.log(LogLevel::Error, &format!("Trend load failed: {e:#}"));
             }
         }
 
@@ -478,7 +506,7 @@ impl App {
                 self.recent_trips = trips;
             }
             Err(e) => {
-                self.log(LogLevel::Error, &format!("Trip load failed: {e}"));
+                self.log(LogLevel::Error, &format!("Trip load failed: {e:#}"));
             }
         }
 
@@ -487,7 +515,10 @@ impl App {
                 self.last_charge_session = session;
             }
             Err(e) => {
-                self.log(LogLevel::Error, &format!("Charge summary load failed: {e}"));
+                self.log(
+                    LogLevel::Error,
+                    &format!("Charge summary load failed: {e:#}"),
+                );
             }
         }
 
@@ -496,7 +527,10 @@ impl App {
                 self.charging_stats = stats;
             }
             Err(e) => {
-                self.log(LogLevel::Error, &format!("Charging stats load failed: {e}"));
+                self.log(
+                    LogLevel::Error,
+                    &format!("Charging stats load failed: {e:#}"),
+                );
             }
         }
 
@@ -516,7 +550,7 @@ impl App {
                 );
             }
             Err(e) => {
-                self.log(LogLevel::Error, &format!("Database failed: {e}"));
+                self.log(LogLevel::Error, &format!("Database failed: {e:#}"));
             }
         }
 
@@ -539,7 +573,7 @@ impl App {
             }
             Err(e) => {
                 self.mode = Mode::Login;
-                self.log(LogLevel::Error, &format!("Auth load error: {e}"));
+                self.log(LogLevel::Error, &format!("Auth load error: {e:#}"));
             }
         }
     }
@@ -579,14 +613,14 @@ impl App {
                                     db.snapshot_count().unwrap_or(self.db_snapshot_count);
                             }
                             Err(e) => {
-                                self.log(LogLevel::Error, &format!("DB write failed: {e}"));
+                                self.log(LogLevel::Error, &format!("DB write failed: {e:#}"));
                             }
                         }
                     }
 
                     if let Some(mqtt) = &self.mqtt {
                         if let Err(e) = mqtt.publish_vehicle_state(&vehicle_id, &state) {
-                            self.log(LogLevel::Error, &format!("MQTT publish failed: {e}"));
+                            self.log(LogLevel::Error, &format!("MQTT publish failed: {e:#}"));
                         }
                     }
 
@@ -769,7 +803,7 @@ impl App {
                         if let Err(e) = db.insert_live_charging_snapshot(&vehicle_id, snap) {
                             self.log(
                                 LogLevel::Error,
-                                &format!("DB live-session write failed: {e}"),
+                                &format!("DB live-session write failed: {e:#}"),
                             );
                         }
                     }
@@ -830,7 +864,7 @@ impl App {
                             Err(e) => {
                                 self.log(
                                     LogLevel::Error,
-                                    &format!("DB charging write failed: {e}"),
+                                    &format!("DB charging write failed: {e:#}"),
                                 );
                                 Vec::new()
                             }
@@ -853,7 +887,7 @@ impl App {
 
                         for session in publish_sessions {
                             if let Err(e) = mqtt.publish_charging_session(vehicle_id, session) {
-                                self.log(LogLevel::Error, &format!("MQTT publish failed: {e}"));
+                                self.log(LogLevel::Error, &format!("MQTT publish failed: {e:#}"));
                                 break;
                             }
                         }
@@ -913,7 +947,7 @@ impl App {
                     let _ = tx.send(AppEvent::Error {
                         generation,
                         source: ErrorSource::Login,
-                        msg: format!("Login failed: {e}"),
+                        msg: ErrorSource::Login.message(&e),
                     });
                 }
             }
@@ -963,7 +997,7 @@ impl App {
                     let _ = tx.send(AppEvent::Error {
                         generation,
                         source: ErrorSource::Otp,
-                        msg: format!("OTP failed: {e}"),
+                        msg: ErrorSource::Otp.message(&e),
                     });
                 }
             }
@@ -1011,7 +1045,7 @@ impl App {
                 Err(e) => AppEvent::Error {
                     generation,
                     source,
-                    msg: format!("{}: {e}", source.label()),
+                    msg: source.message(&e),
                 },
             };
             let _ = tx.send(event);
@@ -1061,10 +1095,20 @@ impl App {
         );
         if started {
             self.poll_in_flight = true;
+            self.last_poll = Some(Instant::now());
             self.vehicle_state_error = None;
             self.log(LogLevel::Info, "Fetching vehicle state...");
         }
         started
+    }
+
+    /// The auto-poll interval has elapsed since the last vehicle-state
+    /// request (or none has gone out yet this session).
+    pub fn poll_due(&self) -> bool {
+        self.tokens.is_some()
+            && self
+                .last_poll
+                .is_none_or(|t| t.elapsed().as_secs() >= self.poll_interval_secs)
     }
 
     /// Release-note URLs only change when the installed or offered OTA
@@ -1245,10 +1289,10 @@ impl App {
                 self.start_session();
             }
             Err(e) => {
-                self.login_error = Some(format!("Saving vehicle selection failed: {e}"));
+                self.login_error = Some(format!("Saving vehicle selection failed: {e:#}"));
                 self.log(
                     LogLevel::Error,
-                    &format!("Saving vehicle selection failed: {e}"),
+                    &format!("Saving vehicle selection failed: {e:#}"),
                 );
             }
         }
@@ -1267,6 +1311,7 @@ impl App {
         self.generation += 1;
         self.tokens = None;
         self.poll_in_flight = false;
+        self.last_poll = None;
         self.vehicle_state = None;
         self.vehicle_metadata = None;
         self.recent_trend.clear();
@@ -1283,6 +1328,7 @@ impl App {
         self.login_email.clear();
         self.login_password.clear();
         self.login_otp.clear();
+        self.login_field = LoginField::Email;
         self.login_error = None;
         self.login_busy = false;
         self.vehicle_selection_index = 0;
@@ -1296,7 +1342,6 @@ impl App {
         self.login_field = match self.login_field {
             LoginField::Email => LoginField::Password,
             LoginField::Password => LoginField::Email,
-            LoginField::Otp => LoginField::Otp,
         };
     }
 
@@ -1305,7 +1350,6 @@ impl App {
         match self.login_field {
             LoginField::Email => &mut self.login_email,
             LoginField::Password => &mut self.login_password,
-            LoginField::Otp => &mut self.login_otp,
         }
     }
 
@@ -1330,7 +1374,7 @@ impl App {
             self.log_selected += 1;
         }
 
-        let visible = 10;
+        let visible = self.log_visible_rows();
         if self.log_selected >= self.log_scroll + visible {
             self.log_scroll = self.log_selected + 1 - visible;
         }
@@ -1509,6 +1553,17 @@ mod tests {
     }
 
     #[test]
+    fn error_messages_keep_the_underlying_cause() {
+        // `login()` wraps the server's reason in a generic context; the
+        // login screen must still show the reason, not just the wrapper.
+        let err = anyhow::anyhow!("GraphQL errors: Invalid email or password")
+            .context("login request failed");
+        let msg = ErrorSource::Login.message(&err);
+        assert!(msg.starts_with("Login failed: "), "{msg}");
+        assert!(msg.contains("Invalid email or password"), "{msg}");
+    }
+
+    #[test]
     fn login_errors_still_reach_login_screen() {
         let mut app = App::new(false, None);
         app.login_busy = true;
@@ -1576,6 +1631,28 @@ mod tests {
             app.poll_vehicle_state(),
             "poll must be allowed again after the previous one finished"
         );
+    }
+
+    #[tokio::test]
+    async fn any_started_poll_resets_the_auto_poll_timer() {
+        let mut app = App::new(false, None);
+        app.tokens = Some(sample_tokens());
+        app.api_url = "http://127.0.0.1:9/graphql".into();
+        assert!(app.poll_due(), "a session that never polled is due");
+
+        // The post-login bundle polls from inside the event handler, not the
+        // main loop's timer — it must still count as the scheduled poll.
+        assert!(app.poll_vehicle_state());
+        assert!(
+            !app.poll_due(),
+            "a poll that just went out must not be followed by another"
+        );
+    }
+
+    #[test]
+    fn poll_is_never_due_without_a_session() {
+        let app = App::new(false, None);
+        assert!(!app.poll_due());
     }
 
     #[test]

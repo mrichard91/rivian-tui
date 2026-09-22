@@ -29,7 +29,7 @@ cargo check
 
 ## Key conventions
 
-- Error handling: `anyhow::Result<T>` everywhere
+- Error handling: `anyhow::Result<T>` everywhere. Format errors shown to the user with `{e:#}` (or `ErrorSource::message`) — plain `{e}` prints only the outermost `.context()` and hides the real cause
 - No secrets in the repo — auth tokens live in the OS keychain
 - Headers mimic the iOS Rivian app for API compatibility
 - Vehicle state fields use `Option<StateValue<T>>` pattern from the GraphQL API
