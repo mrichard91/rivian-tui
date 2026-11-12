@@ -17,6 +17,7 @@ use crate::db::{ChargeSessionSummary, ChargingStats, Trip, VehicleTrendPoint};
 /// A flat, pre-formatted view of the dashboard intended for HTML/JSON output.
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardView {
+    pub dayboard: Option<serde_json::Value>,
     pub vehicle_id: Option<String>,
     pub vehicle_label: String,
     pub vehicle_metadata: Option<VehicleMetadataView>,
@@ -340,8 +341,7 @@ fn state_is(field: &Option<StateValue>, expected: &str) -> bool {
 
 /// A door/closure field reports something other than shut. The wire uses
 /// `open` and, for the frunk, `ajar`; `signal_not_available` (tonneau on
-/// vehicles without one) normalizes to None and counts as shut. Shared by
-/// the alert strip and the Vehicle-card summary so they can't disagree.
+/// vehicles without one) normalizes to None and does not raise an alert.
 fn closure_is_open(field: &Option<StateValue>) -> bool {
     normalized_state(field).is_some_and(|state| matches!(state.as_str(), "open" | "ajar"))
 }
@@ -626,6 +626,7 @@ impl DashboardView {
             };
 
         Self {
+            dayboard: crate::dayboard::details(data),
             vehicle_id: data.vehicle_id.clone(),
             vehicle_label: data
                 .vehicle_metadata
@@ -782,10 +783,18 @@ impl VehicleView {
             &vs.closure_side_bin_right_closed,
             &vs.closure_tonneau_closed,
         ];
-        let all_closed = if closures.iter().all(|f| !closure_is_open(f)) {
+        let all_closed = if closures
+            .iter()
+            .any(|f| crate::dayboard::closure_state(f) == "open")
+        {
+            "open"
+        } else if closures
+            .iter()
+            .all(|f| crate::dayboard::closure_state(f) == "closed")
+        {
             "all closed"
         } else {
-            "open"
+            "unknown"
         };
 
         Self {
@@ -1495,6 +1504,41 @@ mod tests {
             .items
             .iter()
             .any(|alert| alert.severity == AlertSeverity::Critical));
+    }
+
+    #[test]
+    fn closure_summary_requires_known_closed_states() {
+        assert_eq!(
+            VehicleView::from_state(&VehicleStateFields::default()).all_closed,
+            "unknown"
+        );
+
+        let mut vs = VehicleStateFields {
+            door_front_left_closed: state_value(json!("closed")),
+            door_front_right_closed: state_value(json!("closed")),
+            door_rear_left_closed: state_value(json!("closed")),
+            door_rear_right_closed: state_value(json!("closed")),
+            closure_frunk_closed: state_value(json!("closed")),
+            closure_liftgate_closed: state_value(json!("closed")),
+            closure_tailgate_closed: state_value(json!("closed")),
+            closure_side_bin_left_closed: state_value(json!("closed")),
+            closure_side_bin_right_closed: state_value(json!("closed")),
+            closure_tonneau_closed: state_value(json!("closed")),
+            ..Default::default()
+        };
+        assert_eq!(VehicleView::from_state(&vs).all_closed, "all closed");
+
+        for value in [
+            json!(null),
+            json!("signal_not_available"),
+            json!("unfamiliar"),
+        ] {
+            vs.closure_tonneau_closed = state_value(value);
+            assert_eq!(VehicleView::from_state(&vs).all_closed, "unknown");
+        }
+
+        vs.closure_frunk_closed = state_value(json!("ajar"));
+        assert_eq!(VehicleView::from_state(&vs).all_closed, "open");
     }
 
     #[test]

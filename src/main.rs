@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod config;
+mod dayboard;
 mod db;
 mod mqtt;
 mod tui;
